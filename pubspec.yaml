@@ -1,7 +1,7 @@
 name: socks_socket
-description: SOCKS5 client implementation for Dart and Flutter.  Now with SSL!
-version: 0.1.0
-repository: https://github.com/cypherstack/socks_socket
+description: SOCKS version 5 sockets for Dart and Flutter, *eg.* ElectrumX and/or Fulcrum over Tor via socket(s).
+version: 1.0.0
+repository: https://github.com/sneurlax/socks_socket
 
 environment:
   sdk: ^3.0.6

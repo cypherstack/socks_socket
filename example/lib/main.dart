@@ -1,32 +1,14 @@
-/// TODO make a good example.  Here's one which is incomplete because it doesn't
-/// include tor.  After Foundation-Devices/tor publishes their tor package, then
-/// we can use that to make a good example.
-///
-/// See cypherstack/tor's example for a good example of using this SOCKSSocket
-/// class/package.
-/*
-  // Instantiate a socks socket at localhost and on the port selected by the
-  // tor service.
-  var socksSocket = await SOCKSSocket.create(
-    proxyHost: InternetAddress.loopbackIPv4.address,
-    proxyPort: tor.port,
-    // sslEnabled: true, // For SSL connections.
-  );
-
-  // Connect to the socks instantiated above.
-  await socksSocket.connect();
-
-  // Connect to bitcoincash.stackwallet.com on port 50001 via socks socket.
-  await socksSocket.connectTo('bitcoincash.stackwallet.com', 50001);
-
-  // Send a server features command to the connected socket, see method for
-  // more specific usage example..
-  await socksSocket.sendServerFeaturesCommand();
-  await socksSocket.close();
- */
+// Example app deps, not necessarily needed for tor usage.
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
-import 'package:socks_socket/socks_socket.dart';
+import 'package:path_provider/path_provider.dart';
+// Imports needed for tor usage:
+import 'package:socks5_proxy/socks_client.dart'; // Just for example; can use any socks5 proxy package, pick your favorite.
+import 'package:tor_ffi_plugin/tor_ffi_plugin.dart';
+import 'package:tor_ffi_plugin/socks_socket.dart'; // For socket connections
 
 void main() {
   runApp(const MyApp());
@@ -35,119 +17,209 @@ void main() {
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a blue toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
-        useMaterial3: true,
-      ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+    return const MaterialApp(
+      home: Home(),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
+class Home extends StatefulWidget {
+  const Home({super.key});
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<Home> createState() => _MyAppState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class _MyAppState extends State<Home> {
+  // Flag to track if tor has started.
+  bool torIsRunning = false;
 
-  void _incrementCounter() {
+  // Set the default text for the host input field.
+  final hostController = TextEditingController(text: 'https://icanhazip.com/');
+  // https://check.torproject.org is another good option.
+
+  Future<void> startTor() async {
+    // Start the Tor daemon.
+    await Tor.instance.start(
+      torDataDirPath: (await getApplicationSupportDirectory()).path,
+    );
+
+    // Toggle started flag.
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+      torIsRunning = Tor.instance.status == TorStatus.on; // Update flag
     });
+
+    print('Done awaiting; tor should be running');
+  }
+
+  @override
+  void dispose() {
+    // Clean up the controller when the widget is disposed.
+    hostController.dispose();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
+    const spacerSmall = SizedBox(height: 10);
     return Scaffold(
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
+        title: const Text('Tor example'),
       ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            const Text(
-              'You have pushed the button this many times:',
-            ),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
-            ),
-          ],
+      body: SingleChildScrollView(
+        child: Container(
+          padding: const EdgeInsets.all(10),
+          child: Column(
+            children: [
+              TextButton(
+                onPressed: torIsRunning
+                    ? null
+                    : () async {
+                  unawaited(
+                    showDialog(
+                      barrierDismissible: false,
+                      context: context,
+                      builder: (_) => const Dialog(
+                        child: Padding(
+                          padding: EdgeInsets.all(20.0),
+                          child: Text("Starting tor..."),
+                        ),
+                      ),
+                    ),
+                  );
+
+                  final time = DateTime.now();
+
+                  print("NOW: $time");
+
+                  await startTor();
+
+                  print("Start tor took "
+                      "${DateTime.now().difference(time).inSeconds} "
+                      "seconds");
+
+                  if (mounted) {
+                    Navigator.of(context).pop();
+                  }
+                },
+                child: const Text("Start tor"),
+              ),
+              Row(
+                children: [
+                  // Host input field.
+                  Expanded(
+                    child: TextField(
+                      controller: hostController,
+                      decoration: const InputDecoration(
+                        border: OutlineInputBorder(),
+                        hintText: 'Host to request',
+                      ),
+                    ),
+                  ),
+                  spacerSmall,
+                  TextButton(
+                    onPressed: torIsRunning
+                        ? () async {
+                      // `socks5_proxy` package example, use another socks5
+                      // connection of your choice.
+
+                      // Create HttpClient object
+                      final client = HttpClient();
+
+                      // Assign connection factory.
+                      SocksTCPClient.assignToHttpClient(client, [
+                        ProxySettings(InternetAddress.loopbackIPv4,
+                            Tor.instance.port,
+                            password:
+                            null), // TODO Need to get from tor config file.
+                      ]);
+
+                      // GET request.
+                      final request = await client
+                          .getUrl(Uri.parse(hostController.text));
+                      final response = await request.close();
+
+                      // Print response.
+                      var responseString =
+                      await utf8.decodeStream(response);
+                      print(responseString);
+                      // If host input left to default icanhazip.com, a Tor
+                      // exit node IP should be printed to the console.
+                      //
+                      // https://check.torproject.org is also good for
+                      // doublechecking torability.
+
+                      // Close client
+                      client.close();
+                    }
+                        : null,
+                    child: const Text("Make proxied request"),
+                  ),
+                ],
+              ),
+              spacerSmall,
+              TextButton(
+                onPressed: torIsRunning
+                    ? () async {
+                  // Instantiate a socks socket at localhost and on the port selected by the tor service.
+                  var socksSocket = await SOCKSSocket.create(
+                    proxyHost: InternetAddress.loopbackIPv4.address,
+                    proxyPort: Tor.instance.port,
+                    sslEnabled: true, // For SSL connections.
+                  );
+
+                  // Connect to the socks instantiated above.
+                  await socksSocket.connect();
+
+                  // Connect to bitcoin.stackwallet.com on port 50002 via socks socket.
+                  //
+                  // Note that this is an SSL example.
+                  await socksSocket.connectTo(
+                      'bitcoin.stackwallet.com', 50002);
+
+                  // Send a server features command to the connected socket, see method for more specific usage example..
+                  await socksSocket.sendServerFeaturesCommand();
+
+                  // You should see a server response printed to the console.
+                  //
+                  // Example response:
+                  // `flutter: secure responseData: {
+                  // 	"id": "0",
+                  // 	"jsonrpc": "2.0",
+                  // 	"result": {
+                  // 		"cashtokens": true,
+                  // 		"dsproof": true,
+                  // 		"genesis_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+                  // 		"hash_function": "sha256",
+                  // 		"hosts": {
+                  // 			"bitcoin.stackwallet.com": {
+                  // 				"ssl_port": 50002,
+                  // 				"tcp_port": 50001,
+                  // 				"ws_port": 50003,
+                  // 				"wss_port": 50004
+                  // 			}
+                  // 		},
+                  // 		"protocol_max": "1.5",
+                  // 		"protocol_min": "1.4",
+                  // 		"pruning": null,
+                  // 		"server_version": "Fulcrum 1.9.1"
+                  // 	}
+                  // }
+
+                  // Close the socket.
+                  await socksSocket.close();
+                }
+                    : null,
+                child: const Text(
+                  "Connect to bitcoin.stackwallet.com:50002 (SSL) via socks socket",
+                ),
+              ),
+            ],
+          ),
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ), // This trailing comma makes auto-formatting nicer for build methods.
     );
   }
 }

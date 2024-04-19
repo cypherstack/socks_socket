@@ -1,8 +1,14 @@
-# example
+# socks_socket_example
 
-A new Flutter project.
+Demonstrates how to use the socks_socket package.  Uses cypherstack/tor for the tor service.
+
+## TODO
+
+- Show how/why the other packages available are not suitable for this use case.
 
 ## Getting Started
+
+Run as in `flutter run`.
 
 This project is a starting point for a Flutter application.
 
