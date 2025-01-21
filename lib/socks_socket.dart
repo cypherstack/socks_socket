@@ -276,15 +276,19 @@ class SOCKSSocket {
   ///  A Future that resolves to void.
   Future<void> close() async {
     // Ensure all data is sent before closing.
-    //
-    // TODO test this.
-    if (sslEnabled) {
+    try {
+      if (sslEnabled) {
+        await _secureSocksSocket.flush();
+      }
       await _socksSocket.flush();
-      await _secureResponseController.close();
+    } finally {
+      await _subscription?.cancel();
+      await _socksSocket.close();
+      _responseController.close();
+      if (sslEnabled) {
+        _secureResponseController.close();
+      }
     }
-    await _socksSocket.flush();
-    await _responseController.close();
-    return await _socksSocket.close();
   }
 
   StreamSubscription<List<int>> listen(
