@@ -1,7 +1,7 @@
 name: socks_socket
 description: SOCKS version 5 sockets for Dart and Flutter, *eg.* ElectrumX and/or Fulcrum over Tor via socket(s).
-version: 1.0.0
-repository: https://github.com/sneurlax/socks_socket
+version: 1.1.0
+repository: https://github.com/cypherstack/socks_socket
 
 environment:
   sdk: ^3.0.6
