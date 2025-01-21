@@ -156,7 +156,7 @@ class SOCKSSocket {
       },
       onDone: () {
         // Close the response controller when the socket is closed.
-        _responseController.close();
+        // _responseController.close();
       },
     );
   }
