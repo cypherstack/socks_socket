@@ -2,6 +2,14 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+/// Connection state of a [SOCKSSocket].
+enum ConnectionState {
+  disconnected,
+  connecting,
+  connected,
+  error,
+}
+
 /// A SOCKS5 socket.
 ///
 /// A Dart 3 Socket wrapper that implements the SOCKS5 protocol.  Now with SSL!
@@ -89,6 +97,17 @@ class SOCKSSocket {
   /// Is SSL enabled?
   final bool sslEnabled;
 
+  /// Current connection state.
+  ConnectionState _state = ConnectionState.disconnected;
+
+  ConnectionState get state => _state;
+
+  static const Duration _handshakeTimeout = Duration(seconds: 30);
+  static const int _maxHandshakeBuffer = 1024;
+
+  /// Cached output stream controller.
+  StreamController<List<int>>? _outputController;
+
   /// Private constructor.
   SOCKSSocket._(this.proxyHost, this.proxyPort, this.sslEnabled);
 
@@ -99,17 +118,15 @@ class SOCKSSocket {
 
   /// Provides a StreamSink compatible with List<int> for sending data.
   StreamSink<List<int>> get outputStream {
-    // Create a simple StreamSink wrapper for _socksSocket and
-    // _secureSocksSocket that accepts List<int> and forwards it to write method.
-    var sink = StreamController<List<int>>();
-    sink.stream.listen((data) {
-      if (sslEnabled) {
-        _secureSocksSocket.add(data);
-      } else {
-        _socksSocket.add(data);
-      }
-    });
-    return sink.sink;
+    _outputController ??= StreamController<List<int>>()
+      ..stream.listen((data) {
+        if (sslEnabled) {
+          _secureSocksSocket.add(data);
+        } else {
+          _socksSocket.add(data);
+        }
+      });
+    return _outputController!.sink;
   }
 
   /// Creates a SOCKS5 socket to the specified [proxyHost] and [proxyPort].
@@ -137,7 +154,8 @@ class SOCKSSocket {
     return instance;
   }
 
-  /// Constructor.
+  /// Deprecated. Does not await _init(); use [SOCKSSocket.create].
+  @Deprecated('Use SOCKSSocket.create() instead')
   SOCKSSocket(
       {required this.proxyHost,
       required this.proxyPort,
@@ -165,14 +183,7 @@ class SOCKSSocket {
         _responseController.add(data);
       },
       onError: (e) {
-        // Handle errors.
-        if (e is Object) {
-          _responseController.addError(e);
-        }
-
-        // If the error is not an object, send the error as a string.
-        _responseController.addError("$e");
-        // TODO make sure sending error as string is acceptable.
+        _responseController.addError(e);
       },
       onDone: () {
         // Close the response controller when the socket is closed.
@@ -181,24 +192,148 @@ class SOCKSSocket {
     );
   }
 
+  /// Accumulates [expectedLength] bytes from the response stream.
+  Future<List<int>> _waitForResponse(int expectedLength) {
+    final completer = Completer<List<int>>();
+    final buffer = <int>[];
+    late final StreamSubscription<List<int>> sub;
+
+    sub = _responseController.stream.listen(
+      (data) {
+        buffer.addAll(data);
+        if (buffer.length >= _maxHandshakeBuffer) {
+          sub.cancel();
+          if (!completer.isCompleted) {
+            completer.completeError(
+              Exception('SOCKS5 handshake buffer overflow '
+                  '(${buffer.length} bytes).'));
+          }
+          return;
+        }
+        if (buffer.length >= expectedLength) {
+          sub.cancel();
+          if (!completer.isCompleted) {
+            completer.complete(buffer.sublist(0, expectedLength));
+          }
+        }
+      },
+      onError: (e) {
+        sub.cancel();
+        if (!completer.isCompleted) {
+          completer.completeError(e);
+        }
+      },
+      onDone: () {
+        if (!completer.isCompleted) {
+          completer.completeError(
+            Exception('Connection closed before SOCKS5 response received.'));
+        }
+      },
+    );
+
+    return completer.future.timeout(
+      _handshakeTimeout,
+      onTimeout: () {
+        sub.cancel();
+        throw TimeoutException(
+          'SOCKS5 handshake timed out after '
+          '${_handshakeTimeout.inSeconds} seconds.');
+      },
+    );
+  }
+
+  /// Accumulates a variable-length SOCKS5 connect response.
+  Future<List<int>> _waitForConnectResponse() {
+    final completer = Completer<List<int>>();
+    final buffer = <int>[];
+    late final StreamSubscription<List<int>> sub;
+
+    sub = _responseController.stream.listen(
+      (data) {
+        buffer.addAll(data);
+        if (buffer.length >= _maxHandshakeBuffer) {
+          sub.cancel();
+          if (!completer.isCompleted) {
+            completer.completeError(
+              Exception('SOCKS5 handshake buffer overflow '
+                  '(${buffer.length} bytes).'));
+          }
+          return;
+        }
+        if (buffer.length >= 5) {
+          final expectedLength = _calcConnectResponseLength(buffer);
+          if (expectedLength != null && buffer.length >= expectedLength) {
+            sub.cancel();
+            if (!completer.isCompleted) {
+              completer.complete(buffer.sublist(0, expectedLength));
+            }
+          }
+        }
+      },
+      onError: (e) {
+        sub.cancel();
+        if (!completer.isCompleted) {
+          completer.completeError(e);
+        }
+      },
+      onDone: () {
+        if (!completer.isCompleted) {
+          completer.completeError(
+            Exception('Connection closed before SOCKS5 response received.'));
+        }
+      },
+    );
+
+    return completer.future.timeout(
+      _handshakeTimeout,
+      onTimeout: () {
+        sub.cancel();
+        throw TimeoutException(
+          'SOCKS5 handshake timed out after '
+          '${_handshakeTimeout.inSeconds} seconds.');
+      },
+    );
+  }
+
+  /// Expected response length by ATYP, or null if undetermined.
+  static int? _calcConnectResponseLength(List<int> buf) {
+    if (buf.length < 4) return null;
+    switch (buf[3]) {
+      case 0x01:
+        return 10; // IPv4: 4 header + 4 addr + 2 port
+      case 0x03:
+        return buf.length >= 5
+            ? 4 + 1 + buf[4] + 2 // Domain: 4 header + 1 len + domain + 2 port
+            : null;
+      case 0x04:
+        return 22; // IPv6: 4 header + 16 addr + 2 port
+      default:
+        return null;
+    }
+  }
+
   /// Connects to the SOCKS socket.
   ///
   /// Returns:
   ///  A Future that resolves to void.
   Future<void> connect() async {
-    // Greeting and method selection.
-    _socksSocket.add([0x05, 0x01, 0x00]);
+    _state = ConnectionState.connecting;
+    try {
+      // Greeting and method selection.
+      _socksSocket.add([0x05, 0x01, 0x00]);
 
-    // Wait for server response.
-    var response = await _responseController.stream.first;
+      // Wait for server response (2 bytes per RFC 1928).
+      var response = await _waitForResponse(2);
 
-    // Check if the connection was successful.
-    if (response[1] != 0x00) {
-      throw Exception(
-          'socks_socket.connect(): Failed to connect to SOCKS5 proxy.');
+      // Check if the connection was successful.
+      if (response[1] != 0x00) {
+        throw Exception(
+            'socks_socket.connect(): Failed to connect to SOCKS5 proxy.');
+      }
+    } catch (e) {
+      _state = ConnectionState.error;
+      rethrow;
     }
-
-    return;
   }
 
   /// Connects to the specified [domain] and [port] through the SOCKS socket.
@@ -210,63 +345,66 @@ class SOCKSSocket {
   /// Returns:
   ///   A Future that resolves to void.
   Future<void> connectTo(String domain, int port) async {
-    // Connect command.
-    var request = [
-      0x05, // SOCKS version.
-      0x01, // Connect command.
-      0x00, // Reserved.
-      0x03, // Domain name.
-      domain.length,
-      ...domain.codeUnits,
-      (port >> 8) & 0xFF,
-      port & 0xFF
-    ];
-
-    // Send the connect command to the SOCKS proxy server.
-    _socksSocket.add(request);
-
-    // Wait for server response.
-    var response = await _responseController.stream.first;
-
-    // Check if the connection was successful.
-    if (response[1] != 0x00) {
-      throw Exception(
-          'socks_socket.connectTo(): Failed to connect to target through SOCKS5 proxy.');
+    if (_state != ConnectionState.connecting) {
+      throw StateError(
+          'Cannot connectTo: must call connect() first (state: $_state)');
     }
 
-    // Upgrade to SSL if needed.
-    if (sslEnabled) {
-      // Upgrade to SSL.
-      _secureSocksSocket = await SecureSocket.secure(
-        _socksSocket,
-        host: domain,
-        // onBadCertificate: (_) => true, // Uncomment this to bypass certificate validation (NOT recommended for production).
-      );
+    try {
+      // Connect command.
+      var request = [
+        0x05, // SOCKS version.
+        0x01, // Connect command.
+        0x00, // Reserved.
+        0x03, // Domain name.
+        domain.length,
+        ...domain.codeUnits,
+        (port >> 8) & 0xFF,
+        port & 0xFF
+      ];
 
-      // Listen to the secure socket.
-      _subscription = _secureSocksSocket.listen(
-        (data) {
-          // Add the data to the response controller.
-          _secureResponseController.add(data);
-        },
-        onError: (e) {
-          // Handle errors.
-          if (e is Object) {
+      // Send the connect command to the SOCKS proxy server.
+      _socksSocket.add(request);
+
+      // Wait for server response (variable length per RFC 1928).
+      var response = await _waitForConnectResponse();
+
+      // Check if the connection was successful.
+      if (response[1] != 0x00) {
+        throw Exception(
+            'socks_socket.connectTo(): Failed to connect to target through SOCKS5 proxy.');
+      }
+
+      // Upgrade to SSL if needed.
+      if (sslEnabled) {
+        // Upgrade to SSL.
+        _secureSocksSocket = await SecureSocket.secure(
+          _socksSocket,
+          host: domain,
+          // onBadCertificate: (_) => true, // Uncomment this to bypass certificate validation (NOT recommended for production).
+        );
+
+        // Listen to the secure socket.
+        _subscription = _secureSocksSocket.listen(
+          (data) {
+            // Add the data to the response controller.
+            _secureResponseController.add(data);
+          },
+          onError: (e) {
             _secureResponseController.addError(e);
-          }
+          },
+          onDone: () {
+            // Close the response controller when the socket is closed.
+            _secureResponseController.close();
+          },
+        );
+      }
 
-          // If the error is not an object, send the error as a string.
-          _secureResponseController.addError("$e");
-          // TODO make sure sending error as string is acceptable.
-        },
-        onDone: () {
-          // Close the response controller when the socket is closed.
-          _secureResponseController.close();
-        },
-      );
+      _state = ConnectionState.connected;
+    } catch (e) {
+      _state = ConnectionState.error;
+      rethrow;
     }
-
-    return;
   }
 
   /// Converts [object] to a String by invoking [Object.toString] and
@@ -280,6 +418,11 @@ class SOCKSSocket {
   void write(Object? object) {
     // Don't write null.
     if (object == null) return;
+
+    if (_state != ConnectionState.connected) {
+      throw StateError(
+          'Cannot write: socket is not connected (state: $_state)');
+    }
 
     // Write the data to the socket.
     List<int> data = utf8.encode(object.toString());
@@ -295,6 +438,7 @@ class SOCKSSocket {
   /// Returns:
   ///  A Future that resolves to void.
   Future<void> close() async {
+    _state = ConnectionState.disconnected;
     // Ensure all data is sent before closing.
     try {
       if (sslEnabled) {
@@ -303,11 +447,13 @@ class SOCKSSocket {
       await _socksSocket.flush();
     } finally {
       await _subscription?.cancel();
-      await _socksSocket.close();
-      _responseController.close();
+      _outputController?.close();
       if (sslEnabled) {
+        await _secureSocksSocket.close();
         _secureResponseController.close();
       }
+      await _socksSocket.close();
+      _responseController.close();
     }
   }
 
