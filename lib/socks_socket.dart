@@ -65,20 +65,20 @@ class SOCKSSocket {
   final int proxyPort;
 
   /// The underlying Socket that connects to the SOCKS5 proxy server.
-  late final Socket _socksSocket;
+  late Socket _socksSocket;
 
   /// Getter for the underlying Socket that connects to the SOCKS5 proxy server.
   Socket get socket => sslEnabled ? _secureSocksSocket : _socksSocket;
 
   /// A wrapper around the _socksSocket that enables SSL connections.
-  late final Socket _secureSocksSocket;
+  late Socket _secureSocksSocket;
 
   /// A StreamController that listens to the _socksSocket and broadcasts.
-  final StreamController<List<int>> _responseController =
+  StreamController<List<int>> _responseController =
       StreamController.broadcast();
 
   /// A StreamController that listens to the _secureSocksSocket and broadcasts.
-  final StreamController<List<int>> _secureResponseController =
+  StreamController<List<int>> _secureResponseController =
       StreamController.broadcast();
 
   /// Getter for the StreamController that listens to the _socksSocket and
@@ -102,14 +102,26 @@ class SOCKSSocket {
 
   ConnectionState get state => _state;
 
-  static const Duration _handshakeTimeout = Duration(seconds: 30);
+  /// Target domain for [reconnect].
+  String? _targetDomain;
+
+  /// Target port for [reconnect].
+  int? _targetPort;
+
+  /// Timeout for SOCKS5 handshake and TCP connect.
+  final Duration _handshakeTimeout;
+
+  /// Timeout for socket flush after [write].
+  final Duration _operationTimeout;
+
   static const int _maxHandshakeBuffer = 1024;
 
   /// Cached output stream controller.
   StreamController<List<int>>? _outputController;
 
   /// Private constructor.
-  SOCKSSocket._(this.proxyHost, this.proxyPort, this.sslEnabled);
+  SOCKSSocket._(this.proxyHost, this.proxyPort, this.sslEnabled,
+      this._handshakeTimeout, this._operationTimeout);
 
   /// Provides a stream of data as List<int>.
   Stream<List<int>> get inputStream => sslEnabled
@@ -130,22 +142,16 @@ class SOCKSSocket {
   }
 
   /// Creates a SOCKS5 socket to the specified [proxyHost] and [proxyPort].
-  ///
-  /// This method is a factory constructor that returns a Future that resolves
-  /// to a SOCKSSocket instance.
-  ///
-  /// Parameters:
-  /// - [proxyHost]: The host of the SOCKS5 proxy server.
-  /// - [proxyPort]: The port of the SOCKS5 proxy server.
-  ///
-  /// Returns:
-  ///  A Future that resolves to a SOCKSSocket instance.
-  static Future<SOCKSSocket> create(
-      {required String proxyHost,
-      required int proxyPort,
-      bool sslEnabled = false}) async {
+  static Future<SOCKSSocket> create({
+    required String proxyHost,
+    required int proxyPort,
+    bool sslEnabled = false,
+    Duration handshakeTimeout = const Duration(seconds: 30),
+    Duration operationTimeout = const Duration(seconds: 30),
+  }) async {
     // Create a SOCKS socket instance.
-    var instance = SOCKSSocket._(proxyHost, proxyPort, sslEnabled);
+    var instance = SOCKSSocket._(
+        proxyHost, proxyPort, sslEnabled, handshakeTimeout, operationTimeout);
 
     // Initialize the SOCKS socket.
     await instance._init();
@@ -156,10 +162,12 @@ class SOCKSSocket {
 
   /// Deprecated. Does not await _init(); use [SOCKSSocket.create].
   @Deprecated('Use SOCKSSocket.create() instead')
-  SOCKSSocket(
-      {required this.proxyHost,
-      required this.proxyPort,
-      required this.sslEnabled}) {
+  SOCKSSocket({
+    required this.proxyHost,
+    required this.proxyPort,
+    required this.sslEnabled,
+  })  : _handshakeTimeout = const Duration(seconds: 30),
+        _operationTimeout = const Duration(seconds: 30) {
     _init();
   }
 
@@ -174,6 +182,7 @@ class SOCKSSocket {
     _socksSocket = await Socket.connect(
       proxyHost,
       proxyPort,
+      timeout: _handshakeTimeout,
     );
 
     // Listen to the socket.
@@ -350,6 +359,9 @@ class SOCKSSocket {
           'Cannot connectTo: must call connect() first (state: $_state)');
     }
 
+    _targetDomain = domain;
+    _targetPort = port;
+
     try {
       // Connect command.
       var request = [
@@ -407,15 +419,8 @@ class SOCKSSocket {
     }
   }
 
-  /// Converts [object] to a String by invoking [Object.toString] and
-  /// sends the encoding of the result to the socket.
-  ///
-  /// Parameters:
-  /// - [object]: The object to write to the socket.
-  ///
-  /// Returns:
-  ///  A Future that resolves to void.
-  void write(Object? object) {
+  /// Writes [object] to the socket. If [newline] is true, appends '\n'.
+  Future<void> write(Object? object, {bool newline = false}) async {
     // Don't write null.
     if (object == null) return;
 
@@ -426,10 +431,15 @@ class SOCKSSocket {
 
     // Write the data to the socket.
     List<int> data = utf8.encode(object.toString());
+    if (newline) {
+      data = [...data, 0x0A]; // Append \n byte.
+    }
     if (sslEnabled) {
       _secureSocksSocket.add(data);
+      await _secureSocksSocket.flush().timeout(_operationTimeout);
     } else {
       _socksSocket.add(data);
+      await _socksSocket.flush().timeout(_operationTimeout);
     }
   }
 
@@ -450,11 +460,41 @@ class SOCKSSocket {
       _outputController?.close();
       if (sslEnabled) {
         await _secureSocksSocket.close();
-        _secureResponseController.close();
+        if (!_secureResponseController.isClosed) {
+          _secureResponseController.close();
+        }
       }
       await _socksSocket.close();
-      _responseController.close();
+      if (!_responseController.isClosed) {
+        _responseController.close();
+      }
     }
+  }
+
+  /// Reconnects to the previously connected target.
+  ///
+  /// Throws [StateError] if [connectTo] was never called.
+  Future<void> reconnect() async {
+    if (_targetDomain == null || _targetPort == null) {
+      throw StateError('Cannot reconnect: no target known. '
+          'Call connectTo() before reconnect().');
+    }
+
+    try {
+      await close();
+    } catch (_) {
+      // Connection may already be broken.
+    }
+
+    // Broadcast controllers can't be reused after close.
+    _responseController = StreamController.broadcast();
+    _secureResponseController = StreamController.broadcast();
+    _outputController = null;
+
+    // Re-establish connection sequence.
+    await _init();
+    await connect();
+    await connectTo(_targetDomain!, _targetPort!);
   }
 
   StreamSubscription<List<int>> listen(
