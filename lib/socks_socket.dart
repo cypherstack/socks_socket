@@ -119,9 +119,13 @@ class SOCKSSocket {
   /// Cached output stream controller.
   StreamController<List<int>>? _outputController;
 
+  /// Accept bad certificates (testing only).
+  final bool _allowBadCertificates;
+
   /// Private constructor.
   SOCKSSocket._(this.proxyHost, this.proxyPort, this.sslEnabled,
-      this._handshakeTimeout, this._operationTimeout);
+      this._handshakeTimeout, this._operationTimeout,
+      this._allowBadCertificates);
 
   /// Provides a stream of data as List<int>.
   Stream<List<int>> get inputStream => sslEnabled
@@ -148,10 +152,11 @@ class SOCKSSocket {
     bool sslEnabled = false,
     Duration handshakeTimeout = const Duration(seconds: 30),
     Duration operationTimeout = const Duration(seconds: 30),
+    bool allowBadCertificates = false,
   }) async {
     // Create a SOCKS socket instance.
-    var instance = SOCKSSocket._(
-        proxyHost, proxyPort, sslEnabled, handshakeTimeout, operationTimeout);
+    var instance = SOCKSSocket._(proxyHost, proxyPort, sslEnabled,
+        handshakeTimeout, operationTimeout, allowBadCertificates);
 
     // Initialize the SOCKS socket.
     await instance._init();
@@ -167,7 +172,8 @@ class SOCKSSocket {
     required this.proxyPort,
     required this.sslEnabled,
   })  : _handshakeTimeout = const Duration(seconds: 30),
-        _operationTimeout = const Duration(seconds: 30) {
+        _operationTimeout = const Duration(seconds: 30),
+        _allowBadCertificates = false {
     _init();
   }
 
@@ -393,8 +399,10 @@ class SOCKSSocket {
         _secureSocksSocket = await SecureSocket.secure(
           _socksSocket,
           host: domain,
-          // onBadCertificate: (_) => true, // Uncomment this to bypass certificate validation (NOT recommended for production).
+          onBadCertificate:
+              _allowBadCertificates ? (_) => true : null,
         );
+        _sslUpgraded = true;
 
         // Listen to the secure socket.
         _subscription = _secureSocksSocket.listen(
@@ -447,27 +455,34 @@ class SOCKSSocket {
   ///
   /// Returns:
   ///  A Future that resolves to void.
+  /// Whether SSL upgrade consumed the raw socket.
+  bool _sslUpgraded = false;
+
   Future<void> close() async {
     _state = ConnectionState.disconnected;
     // Ensure all data is sent before closing.
     try {
-      if (sslEnabled) {
+      if (sslEnabled && _sslUpgraded) {
         await _secureSocksSocket.flush();
+      } else {
+        await _socksSocket.flush();
       }
-      await _socksSocket.flush();
     } finally {
       await _subscription?.cancel();
       _outputController?.close();
-      if (sslEnabled) {
+      if (sslEnabled && _sslUpgraded) {
         await _secureSocksSocket.close();
         if (!_secureResponseController.isClosed) {
           _secureResponseController.close();
         }
       }
-      await _socksSocket.close();
+      if (!_sslUpgraded) {
+        await _socksSocket.close();
+      }
       if (!_responseController.isClosed) {
         _responseController.close();
       }
+      _sslUpgraded = false;
     }
   }
 
