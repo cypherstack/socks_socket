@@ -12,12 +12,21 @@ class MockSocksServer {
   final List<dynamic> _clients = [];
 
   bool rejectConnection = false;
+
+  int replyCode = 0x01;
+
   Duration? responseDelay;
+
   bool fragmentResponses = false;
+
   bool hangOnGreeting = false;
+
   bool dropConnection = false;
+
   bool sendInvalidResponse = false;
+
   bool sslEnabled = false;
+
   SecurityContext? securityContext;
 
   Future<void> start() async {
@@ -121,7 +130,7 @@ class MockSocksServer {
 
       if (rejectConnection) {
         await _sendResponse(
-            client, [0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+            client, [0x05, replyCode, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
         return;
       }
 

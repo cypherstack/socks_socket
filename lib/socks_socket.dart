@@ -2,6 +2,103 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+/// SOCKS5 reply codes as defined in RFC 1928 section 6.
+enum SocksReplyCode {
+  /// General SOCKS server failure.
+  generalFailure(0x01, 'General SOCKS server failure'),
+
+  /// Connection not allowed by ruleset.
+  connectionNotAllowed(0x02, 'Connection not allowed by ruleset'),
+
+  /// Network unreachable.
+  networkUnreachable(0x03, 'Network unreachable'),
+
+  /// Host unreachable.
+  hostUnreachable(0x04, 'Host unreachable'),
+
+  /// Connection refused.
+  connectionRefused(0x05, 'Connection refused'),
+
+  /// TTL expired.
+  ttlExpired(0x06, 'TTL expired'),
+
+  /// Command not supported.
+  commandNotSupported(0x07, 'Command not supported'),
+
+  /// Address type not supported.
+  addressTypeNotSupported(0x08, 'Address type not supported');
+
+  /// RFC 1928 byte value.
+  final int byte;
+
+  final String description;
+
+  const SocksReplyCode(this.byte, this.description);
+
+  /// Lookup by byte value. Returns null for unknown or success (0x00).
+  static SocksReplyCode? fromByte(int byte) {
+    for (final code in values) {
+      if (code.byte == byte) return code;
+    }
+    return null;
+  }
+}
+
+/// Base exception for SOCKS5 errors. Sealed; catch subtypes or [Exception].
+sealed class SocksException implements Exception {
+  final String message;
+
+  const SocksException(this.message);
+
+  @override
+  String toString() => message;
+}
+
+/// Thrown when the SOCKS5 greeting/authentication handshake fails.
+class SocksHandshakeException extends SocksException {
+  final String proxyHost;
+
+  final int proxyPort;
+
+  SocksHandshakeException({
+    required this.proxyHost,
+    required this.proxyPort,
+    required String message,
+  }) : super(message);
+}
+
+/// Thrown when a SOCKS5 connect request is rejected.
+class SocksRequestException extends SocksException {
+  final SocksReplyCode? replyCode;
+
+  final String proxyHost;
+
+  final int proxyPort;
+
+  final String targetDomain;
+
+  final int targetPort;
+
+  SocksRequestException({
+    required this.replyCode,
+    required this.proxyHost,
+    required this.proxyPort,
+    required this.targetDomain,
+    required this.targetPort,
+    required String message,
+  }) : super(message);
+}
+
+/// Thrown on transport-level connection errors.
+class SocksConnectionException extends SocksException {
+  SocksConnectionException({required String message}) : super(message);
+}
+
+/// Thrown when a connection is cancelled via [SOCKSSocket.cancel].
+class SocksCancelledException extends SocksException {
+  SocksCancelledException({required String message}) : super(message);
+}
+
 /// Connection state of a [SOCKSSocket].
 enum ConnectionState {
   disconnected,
@@ -123,8 +220,12 @@ class SOCKSSocket {
   final bool _allowBadCertificates;
 
   /// Private constructor.
-  SOCKSSocket._(this.proxyHost, this.proxyPort, this.sslEnabled,
-      this._handshakeTimeout, this._operationTimeout,
+  SOCKSSocket._(
+      this.proxyHost,
+      this.proxyPort,
+      this.sslEnabled,
+      this._handshakeTimeout,
+      this._operationTimeout,
       this._allowBadCertificates);
 
   /// Provides a stream of data as List<int>.
@@ -198,7 +299,13 @@ class SOCKSSocket {
         _responseController.add(data);
       },
       onError: (e) {
-        _responseController.addError(e);
+        _responseController.addError(
+          e is SocksException
+              ? e
+              : SocksConnectionException(
+                  message: 'SOCKS5 connection error: $e',
+                ),
+        );
       },
       onDone: () {
         // Close the response controller when the socket is closed.
@@ -220,8 +327,14 @@ class SOCKSSocket {
           sub.cancel();
           if (!completer.isCompleted) {
             completer.completeError(
-              Exception('SOCKS5 handshake buffer overflow '
-                  '(${buffer.length} bytes).'));
+              SocksHandshakeException(
+                proxyHost: proxyHost,
+                proxyPort: proxyPort,
+                message: 'SOCKS5 handshake buffer overflow '
+                    '(proxy: $proxyHost:$proxyPort, '
+                    '${buffer.length} bytes received).',
+              ),
+            );
           }
           return;
         }
@@ -241,7 +354,11 @@ class SOCKSSocket {
       onDone: () {
         if (!completer.isCompleted) {
           completer.completeError(
-            Exception('Connection closed before SOCKS5 response received.'));
+            SocksConnectionException(
+              message: 'Connection closed before SOCKS5 response received '
+                  '(proxy: $proxyHost:$proxyPort).',
+            ),
+          );
         }
       },
     );
@@ -250,9 +367,8 @@ class SOCKSSocket {
       _handshakeTimeout,
       onTimeout: () {
         sub.cancel();
-        throw TimeoutException(
-          'SOCKS5 handshake timed out after '
-          '${_handshakeTimeout.inSeconds} seconds.');
+        throw TimeoutException('SOCKS5 handshake timed out after '
+            '${_handshakeTimeout.inSeconds} seconds.');
       },
     );
   }
@@ -270,8 +386,14 @@ class SOCKSSocket {
           sub.cancel();
           if (!completer.isCompleted) {
             completer.completeError(
-              Exception('SOCKS5 handshake buffer overflow '
-                  '(${buffer.length} bytes).'));
+              SocksHandshakeException(
+                proxyHost: proxyHost,
+                proxyPort: proxyPort,
+                message: 'SOCKS5 handshake buffer overflow '
+                    '(proxy: $proxyHost:$proxyPort, '
+                    '${buffer.length} bytes received).',
+              ),
+            );
           }
           return;
         }
@@ -294,7 +416,11 @@ class SOCKSSocket {
       onDone: () {
         if (!completer.isCompleted) {
           completer.completeError(
-            Exception('Connection closed before SOCKS5 response received.'));
+            SocksConnectionException(
+              message: 'Connection closed before SOCKS5 response received '
+                  '(proxy: $proxyHost:$proxyPort).',
+            ),
+          );
         }
       },
     );
@@ -303,9 +429,8 @@ class SOCKSSocket {
       _handshakeTimeout,
       onTimeout: () {
         sub.cancel();
-        throw TimeoutException(
-          'SOCKS5 handshake timed out after '
-          '${_handshakeTimeout.inSeconds} seconds.');
+        throw TimeoutException('SOCKS5 handshake timed out after '
+            '${_handshakeTimeout.inSeconds} seconds.');
       },
     );
   }
@@ -342,8 +467,13 @@ class SOCKSSocket {
 
       // Check if the connection was successful.
       if (response[1] != 0x00) {
-        throw Exception(
-            'socks_socket.connect(): Failed to connect to SOCKS5 proxy.');
+        throw SocksHandshakeException(
+          proxyHost: proxyHost,
+          proxyPort: proxyPort,
+          message: 'SOCKS5 handshake failed '
+              '(proxy: $proxyHost:$proxyPort): '
+              'proxy rejected authentication method.',
+        );
       }
     } catch (e) {
       _state = ConnectionState.error;
@@ -389,8 +519,18 @@ class SOCKSSocket {
 
       // Check if the connection was successful.
       if (response[1] != 0x00) {
-        throw Exception(
-            'socks_socket.connectTo(): Failed to connect to target through SOCKS5 proxy.');
+        final replyCode = SocksReplyCode.fromByte(response[1]);
+        throw SocksRequestException(
+          replyCode: replyCode,
+          proxyHost: proxyHost,
+          proxyPort: proxyPort,
+          targetDomain: domain,
+          targetPort: port,
+          message: 'SOCKS5 request failed '
+              '(proxy: $proxyHost:$proxyPort, '
+              'target: $domain:$port, '
+              'reply: ${replyCode?.description ?? "unknown (0x${response[1].toRadixString(16).padLeft(2, '0')})"})',
+        );
       }
 
       // Upgrade to SSL if needed.
@@ -399,8 +539,7 @@ class SOCKSSocket {
         _secureSocksSocket = await SecureSocket.secure(
           _socksSocket,
           host: domain,
-          onBadCertificate:
-              _allowBadCertificates ? (_) => true : null,
+          onBadCertificate: _allowBadCertificates ? (_) => true : null,
         );
         _sslUpgraded = true;
 
@@ -411,7 +550,13 @@ class SOCKSSocket {
             _secureResponseController.add(data);
           },
           onError: (e) {
-            _secureResponseController.addError(e);
+            _secureResponseController.addError(
+              e is SocksException
+                  ? e
+                  : SocksConnectionException(
+                      message: 'SOCKS5 connection error: $e',
+                    ),
+            );
           },
           onDone: () {
             // Close the response controller when the socket is closed.
