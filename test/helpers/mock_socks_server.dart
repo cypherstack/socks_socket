@@ -25,11 +25,22 @@ class MockSocksServer {
 
   bool sendInvalidResponse = false;
 
+  bool requireAuth = false;
+
+  bool rejectAuth = false;
+
+  String? lastUsername;
+
+  String? lastPassword;
+
   bool sslEnabled = false;
 
   SecurityContext? securityContext;
 
   Future<void> start() async {
+    lastUsername = null;
+    lastPassword = null;
+
     if (sslEnabled) {
       // RawServerSocket for SSL to avoid subscription conflicts.
       _rawServer =
@@ -92,25 +103,92 @@ class MockSocksServer {
       );
 
       // --- Phase: Greeting ---
-      while (buffer.length < 3) {
+      // Wait for at least 2 bytes to read VER and NMETHODS.
+      while (buffer.length < 2) {
+        phaseCompleter = Completer<void>();
+        await phaseCompleter.future;
+      }
+      // Read NMETHODS to know total greeting length: 2 + NMETHODS.
+      final nmethods = buffer[1];
+      final greetingLen = 2 + nmethods;
+      while (buffer.length < greetingLen) {
         phaseCompleter = Completer<void>();
         await phaseCompleter.future;
       }
 
-      await _sendResponse(client, [0x05, 0x00]);
+      // Extract offered methods.
+      final methods = buffer.sublist(2, greetingLen);
+      final offersAuth = methods.contains(0x02);
+
+      if (requireAuth && offersAuth) {
+        // Select username/password auth (0x02).
+        await _sendResponse(client, [0x05, 0x02]);
+
+        // Consume greeting bytes.
+        if (buffer.length > greetingLen) {
+          final excess = buffer.sublist(greetingLen);
+          buffer
+            ..clear()
+            ..addAll(excess);
+        } else {
+          buffer.clear();
+        }
+
+        // Wait for auth sub-negotiation: at least 2 bytes (VER + ULEN).
+        while (buffer.length < 2) {
+          phaseCompleter = Completer<void>();
+          await phaseCompleter.future;
+        }
+        final ulen = buffer[1];
+        // Need: 1 (ver) + 1 (ulen) + ulen (username) + 1 (plen).
+        while (buffer.length < 2 + ulen + 1) {
+          phaseCompleter = Completer<void>();
+          await phaseCompleter.future;
+        }
+        final plen = buffer[2 + ulen];
+        final totalAuthLen = 2 + ulen + 1 + plen;
+        while (buffer.length < totalAuthLen) {
+          phaseCompleter = Completer<void>();
+          await phaseCompleter.future;
+        }
+
+        // Extract username and password.
+        lastUsername = String.fromCharCodes(buffer.sublist(2, 2 + ulen));
+        lastPassword =
+            String.fromCharCodes(buffer.sublist(2 + ulen + 1, totalAuthLen));
+
+        if (rejectAuth) {
+          await _sendResponse(client, [0x01, 0x01]); // Auth failure.
+          return;
+        }
+        await _sendResponse(client, [0x01, 0x00]); // Auth success.
+
+        // Consume auth bytes before connect phase.
+        if (buffer.length > totalAuthLen) {
+          final excess = buffer.sublist(totalAuthLen);
+          buffer
+            ..clear()
+            ..addAll(excess);
+        } else {
+          buffer.clear();
+        }
+      } else {
+        // Select no-auth (0x00) -- original behavior.
+        await _sendResponse(client, [0x05, 0x00]);
+
+        // Consume greeting bytes.
+        if (buffer.length > greetingLen) {
+          final excess = buffer.sublist(greetingLen);
+          buffer
+            ..clear()
+            ..addAll(excess);
+        } else {
+          buffer.clear();
+        }
+      }
 
       // --- Phase: Connect Command ---
-      // Keep any bytes that arrived during the greeting response send
-      // (the client may have already sent the connect command).
       phase = phaseConnect;
-      if (buffer.length > 3) {
-        final excess = buffer.sublist(3);
-        buffer
-          ..clear()
-          ..addAll(excess);
-      } else {
-        buffer.clear();
-      }
 
       while (true) {
         if (buffer.length >= 5) {

@@ -743,4 +743,126 @@ void main() {
       }
     });
   });
+
+  group('Circuit isolation', () {
+    late MockSocksServer server;
+
+    setUp(() async {
+      server = MockSocksServer();
+    });
+
+    tearDown(() async {
+      await server.stop();
+    });
+
+    test('connect with isolationToken performs auth handshake', () async {
+      server.requireAuth = true;
+      await server.start();
+
+      final socket = await SOCKSSocket.create(
+        proxyHost: InternetAddress.loopbackIPv4.address,
+        proxyPort: server.port,
+        isolationToken: 'wallet-btc-001',
+        handshakeTimeout: const Duration(seconds: 5),
+      );
+      await socket.connect();
+      await socket.connectTo('target.onion', 50001);
+      expect(socket.state, ConnectionState.connected);
+      expect(server.lastUsername, 'wallet-btc-001');
+      expect(server.lastPassword, 'wallet-btc-001');
+      await socket.close();
+    });
+
+    test('connect without isolationToken uses no-auth greeting', () async {
+      await server.start();
+
+      final socket = await SOCKSSocket.create(
+        proxyHost: InternetAddress.loopbackIPv4.address,
+        proxyPort: server.port,
+        handshakeTimeout: const Duration(seconds: 5),
+      );
+      await socket.connect();
+      await socket.connectTo('target.onion', 50001);
+      expect(socket.state, ConnectionState.connected);
+      expect(server.lastUsername, isNull);
+      expect(server.lastPassword, isNull);
+      await socket.close();
+    });
+
+    test('connect with token to no-auth server proceeds without sub-negotiation',
+        () async {
+      // Server selects no-auth even though client offers auth.
+      server.requireAuth = false;
+      await server.start();
+
+      final socket = await SOCKSSocket.create(
+        proxyHost: InternetAddress.loopbackIPv4.address,
+        proxyPort: server.port,
+        isolationToken: 'some-token',
+        handshakeTimeout: const Duration(seconds: 5),
+      );
+      await socket.connect();
+      await socket.connectTo('target.onion', 50001);
+      expect(socket.state, ConnectionState.connected);
+      expect(server.lastUsername, isNull);
+      await socket.close();
+    });
+
+    test('auth rejection throws SocksHandshakeException from connect',
+        () async {
+      server.requireAuth = true;
+      server.rejectAuth = true;
+      await server.start();
+
+      final socket = await SOCKSSocket.create(
+        proxyHost: InternetAddress.loopbackIPv4.address,
+        proxyPort: server.port,
+        isolationToken: 'rejected-token',
+        handshakeTimeout: const Duration(seconds: 5),
+      );
+      await expectLater(
+        socket.connect,
+        throwsA(isA<SocksHandshakeException>().having(
+          (e) => e.toString(),
+          'message',
+          contains('username/password auth rejected'),
+        )),
+      );
+      await socket.close();
+    });
+
+    test('reconnect with different isolationToken rotates circuit', () async {
+      server.requireAuth = true;
+      await server.start();
+
+      final socket = await SOCKSSocket.create(
+        proxyHost: InternetAddress.loopbackIPv4.address,
+        proxyPort: server.port,
+        isolationToken: 'circuit-1',
+        handshakeTimeout: const Duration(seconds: 5),
+      );
+      await socket.connect();
+      await socket.connectTo('target.onion', 50001);
+      expect(server.lastUsername, 'circuit-1');
+
+      // Reconnect with a different token.
+      await socket.reconnect(isolationToken: 'circuit-2');
+      expect(server.lastUsername, 'circuit-2');
+      expect(server.lastPassword, 'circuit-2');
+      await socket.close();
+    });
+
+    test('isolationToken exceeding 255 UTF-8 bytes throws ArgumentError',
+        () async {
+      final longToken = 'a' * 256;
+      await expectLater(
+        () => SOCKSSocket.create(
+          proxyHost: InternetAddress.loopbackIPv4.address,
+          proxyPort: 1234,
+          isolationToken: longToken,
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+    });
+  });
 }

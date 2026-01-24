@@ -219,11 +219,15 @@ class SOCKSSocket {
   /// Accept bad certificates (testing only).
   final bool _allowBadCertificates;
 
+  /// Tor circuit isolation token (RFC 1929 username/password auth).
+  String? _isolationToken;
+
   /// Private constructor.
   SOCKSSocket._(
       this.proxyHost,
       this.proxyPort,
       this.sslEnabled,
+      this._isolationToken,
       this._handshakeTimeout,
       this._operationTimeout,
       this._allowBadCertificates);
@@ -251,13 +255,25 @@ class SOCKSSocket {
     required String proxyHost,
     required int proxyPort,
     bool sslEnabled = false,
+    String? isolationToken,
     Duration handshakeTimeout = const Duration(seconds: 30),
     Duration operationTimeout = const Duration(seconds: 30),
     bool allowBadCertificates = false,
   }) async {
+    // RFC 1929 ULEN/PLEN max 255 bytes.
+    if (isolationToken != null &&
+        utf8.encode(isolationToken).length > 255) {
+      throw ArgumentError.value(
+        isolationToken,
+        'isolationToken',
+        'Token UTF-8 encoding exceeds 255 bytes (RFC 1929 limit).',
+      );
+    }
+
     // Create a SOCKS socket instance.
     var instance = SOCKSSocket._(proxyHost, proxyPort, sslEnabled,
-        handshakeTimeout, operationTimeout, allowBadCertificates);
+        isolationToken, handshakeTimeout, operationTimeout,
+        allowBadCertificates);
 
     // Initialize the SOCKS socket.
     await instance._init();
@@ -272,7 +288,8 @@ class SOCKSSocket {
     required this.proxyHost,
     required this.proxyPort,
     required this.sslEnabled,
-  })  : _handshakeTimeout = const Duration(seconds: 30),
+  })  : _isolationToken = null,
+        _handshakeTimeout = const Duration(seconds: 30),
         _operationTimeout = const Duration(seconds: 30),
         _allowBadCertificates = false {
     _init();
@@ -460,19 +477,46 @@ class SOCKSSocket {
     _state = ConnectionState.connecting;
     try {
       // Greeting and method selection.
-      _socksSocket.add([0x05, 0x01, 0x00]);
+      if (_isolationToken != null) {
+        // Offer both no-auth (0x00) and username/password (0x02).
+        _socksSocket.add([0x05, 0x02, 0x00, 0x02]);
+      } else {
+        // Original no-auth only greeting (backward compatible).
+        _socksSocket.add([0x05, 0x01, 0x00]);
+      }
 
       // Wait for server response (2 bytes per RFC 1928).
       var response = await _waitForResponse(2);
 
-      // Check if the connection was successful.
-      if (response[1] != 0x00) {
+      if (_isolationToken != null && response[1] == 0x02) {
+        // Sub-negotiate per RFC 1929.
+        final tokenBytes = utf8.encode(_isolationToken!);
+        _socksSocket.add([
+          0x01, // Sub-negotiation version.
+          tokenBytes.length, // ULEN.
+          ...tokenBytes, // UNAME (token as username).
+          tokenBytes.length, // PLEN.
+          ...tokenBytes, // PASSWD (token as password).
+        ]);
+
+        var authResponse = await _waitForResponse(2);
+        if (authResponse[1] != 0x00) {
+          throw SocksHandshakeException(
+            proxyHost: proxyHost,
+            proxyPort: proxyPort,
+            message: 'SOCKS5 authentication failed: '
+                'username/password auth rejected',
+          );
+        }
+      } else if (response[1] != 0x00) {
+        // Server rejected all methods or selected unknown method.
         throw SocksHandshakeException(
           proxyHost: proxyHost,
           proxyPort: proxyPort,
           message: 'SOCKS5 handshake failed '
               '(proxy: $proxyHost:$proxyPort): '
-              'proxy rejected authentication method.',
+              'proxy rejected authentication method '
+              '(response: 0x${response[1].toRadixString(16).padLeft(2, '0')})',
         );
       }
     } catch (e) {
@@ -634,10 +678,14 @@ class SOCKSSocket {
   /// Reconnects to the previously connected target.
   ///
   /// Throws [StateError] if [connectTo] was never called.
-  Future<void> reconnect() async {
+  Future<void> reconnect({String? isolationToken}) async {
     if (_targetDomain == null || _targetPort == null) {
       throw StateError('Cannot reconnect: no target known. '
           'Call connectTo() before reconnect().');
+    }
+
+    if (isolationToken != null) {
+      _isolationToken = isolationToken;
     }
 
     try {
