@@ -16,6 +16,9 @@ SOCKS version 5 sockets for Dart and Flutter, *eg.* ElectrumX and/or Fulcrum ove
 - Reconnection support without creating a new instance.
 - Newline option for line-delimited protocols (ElectrumX).
 - Connection state tracking (disconnected, connecting, connected, error).
+- Typed exception hierarchy with SOCKS5 reply codes.
+- Tor circuit isolation via `isolationToken`.
+- Cancellation of in-flight connections via `cancel()`.
 
 ## Getting Started
 
@@ -54,6 +57,20 @@ var socksSocket = await SOCKSSocket.create(
     handshakeTimeout: Duration(seconds: 60),
     operationTimeout: Duration(seconds: 45),
 );
+```
+
+## Circuit Isolation
+
+```dart
+// Use isolationToken to request a separate Tor circuit.
+var socksSocket = await SOCKSSocket.create(
+    proxyHost: InternetAddress.loopbackIPv4.address,
+    proxyPort: Tor.instance.port,
+    isolationToken: 'wallet-btc-001',
+);
+
+// Reconnect with a different token to rotate circuits.
+await socksSocket.reconnect(isolationToken: 'wallet-btc-002');
 ```
 
 ## Reconnection
