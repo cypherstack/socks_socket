@@ -865,4 +865,121 @@ void main() {
       );
     });
   });
+
+  group('Cancellation', () {
+    late MockSocksServer server;
+
+    setUp(() async {
+      server = MockSocksServer();
+    });
+
+    tearDown(() async {
+      await server.stop();
+    });
+
+    test('cancel during connect throws SocksCancelledException', () async {
+      server.hangOnGreeting = true;
+      await server.start();
+
+      final socket = await SOCKSSocket.create(
+        proxyHost: InternetAddress.loopbackIPv4.address,
+        proxyPort: server.port,
+        handshakeTimeout: const Duration(seconds: 5),
+      );
+
+      // Capture error so it doesn't leak.
+      Object? caughtError;
+      final connectFuture = socket.connect().catchError((e) {
+        caughtError = e;
+      });
+
+      await Future.delayed(const Duration(milliseconds: 50));
+      await socket.cancel();
+      await connectFuture;
+
+      expect(caughtError, isA<SocksCancelledException>());
+      expect(socket.state, ConnectionState.disconnected);
+    });
+
+    test('cancel during connectTo throws SocksCancelledException', () async {
+      server.hangOnConnect = true;
+      await server.start();
+
+      final socket = await SOCKSSocket.create(
+        proxyHost: InternetAddress.loopbackIPv4.address,
+        proxyPort: server.port,
+        handshakeTimeout: const Duration(seconds: 5),
+      );
+
+      await socket.connect();
+
+      // Capture error so it doesn't leak.
+      Object? caughtError;
+      final connectToFuture = socket.connectTo('example.com', 80).catchError((e) {
+        caughtError = e;
+      });
+
+      await Future.delayed(const Duration(milliseconds: 50));
+      await socket.cancel();
+      await connectToFuture;
+
+      expect(caughtError, isA<SocksCancelledException>());
+      expect(socket.state, ConnectionState.disconnected);
+    });
+
+    test('cancel after connected is silent no-op', () async {
+      await server.start();
+
+      final socket = await SOCKSSocket.create(
+        proxyHost: InternetAddress.loopbackIPv4.address,
+        proxyPort: server.port,
+      );
+      await socket.connect();
+      await socket.connectTo('example.com', 80);
+      expect(socket.state, ConnectionState.connected);
+
+      await socket.cancel(); // Should not throw or change state
+      expect(socket.state, ConnectionState.connected);
+
+      await socket.close();
+    });
+
+    test('cancel on disconnected socket is silent no-op', () async {
+      await server.start();
+
+      final socket = await SOCKSSocket.create(
+        proxyHost: InternetAddress.loopbackIPv4.address,
+        proxyPort: server.port,
+      );
+      await socket.connect();
+      await socket.connectTo('example.com', 80);
+      await socket.close();
+      expect(socket.state, ConnectionState.disconnected);
+
+      await socket.cancel(); // Should not throw
+      expect(socket.state, ConnectionState.disconnected);
+    });
+
+    test('state is disconnected after cancel during connect (resource cleanup)',
+        () async {
+      server.hangOnGreeting = true;
+      await server.start();
+
+      final socket = await SOCKSSocket.create(
+        proxyHost: InternetAddress.loopbackIPv4.address,
+        proxyPort: server.port,
+        handshakeTimeout: const Duration(seconds: 5),
+      );
+
+      final connectFuture = socket.connect().catchError((_) {});
+
+      await Future.delayed(const Duration(milliseconds: 50));
+      await socket.cancel();
+      await connectFuture;
+
+      expect(socket.state, ConnectionState.disconnected);
+      await socket.cancel(); // Double cancel is safe.
+      expect(socket.state, ConnectionState.disconnected);
+    });
+  });
 }

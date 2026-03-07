@@ -219,6 +219,12 @@ class SOCKSSocket {
   /// Accept bad certificates (testing only).
   final bool _allowBadCertificates;
 
+  /// Cancel signal for in-flight operations.
+  Completer<Never>? _cancelCompleter;
+
+  /// Whether SSL upgrade is in progress.
+  bool _sslUpgrading = false;
+
   /// Tor circuit isolation token (RFC 1929 username/password auth).
   String? _isolationToken;
 
@@ -380,7 +386,7 @@ class SOCKSSocket {
       },
     );
 
-    return completer.future.timeout(
+    final dataFuture = completer.future.timeout(
       _handshakeTimeout,
       onTimeout: () {
         sub.cancel();
@@ -388,6 +394,12 @@ class SOCKSSocket {
             '${_handshakeTimeout.inSeconds} seconds.');
       },
     );
+
+    final cancel = _cancelCompleter;
+    if (cancel != null) {
+      return Future.any<List<int>>([dataFuture, cancel.future]);
+    }
+    return dataFuture;
   }
 
   /// Accumulates a variable-length SOCKS5 connect response.
@@ -442,7 +454,7 @@ class SOCKSSocket {
       },
     );
 
-    return completer.future.timeout(
+    final dataFuture = completer.future.timeout(
       _handshakeTimeout,
       onTimeout: () {
         sub.cancel();
@@ -450,6 +462,12 @@ class SOCKSSocket {
             '${_handshakeTimeout.inSeconds} seconds.');
       },
     );
+
+    final cancel = _cancelCompleter;
+    if (cancel != null) {
+      return Future.any<List<int>>([dataFuture, cancel.future]);
+    }
+    return dataFuture;
   }
 
   /// Expected response length by ATYP, or null if undetermined.
@@ -474,6 +492,7 @@ class SOCKSSocket {
   /// Returns:
   ///  A Future that resolves to void.
   Future<void> connect() async {
+    _cancelCompleter = Completer<Never>();
     _state = ConnectionState.connecting;
     try {
       // Greeting and method selection.
@@ -520,7 +539,10 @@ class SOCKSSocket {
         );
       }
     } catch (e) {
-      _state = ConnectionState.error;
+      if (e is! SocksCancelledException) {
+        _state = ConnectionState.error;
+      }
+      _cancelCompleter = null;
       rethrow;
     }
   }
@@ -579,39 +601,62 @@ class SOCKSSocket {
 
       // Upgrade to SSL if needed.
       if (sslEnabled) {
-        // Upgrade to SSL.
-        _secureSocksSocket = await SecureSocket.secure(
-          _socksSocket,
-          host: domain,
-          onBadCertificate: _allowBadCertificates ? (_) => true : null,
-        );
-        _sslUpgraded = true;
+        _sslUpgrading = true;
+        try {
+          // Upgrade to SSL.
+          _secureSocksSocket = await SecureSocket.secure(
+            _socksSocket,
+            host: domain,
+            onBadCertificate: _allowBadCertificates ? (_) => true : null,
+          );
+          _sslUpgrading = false;
+          _sslUpgraded = true;
 
-        // Listen to the secure socket.
-        _subscription = _secureSocksSocket.listen(
-          (data) {
-            // Add the data to the response controller.
-            _secureResponseController.add(data);
-          },
-          onError: (e) {
-            _secureResponseController.addError(
-              e is SocksException
-                  ? e
-                  : SocksConnectionException(
-                      message: 'SOCKS5 connection error: $e',
-                    ),
+          // Listen to the secure socket.
+          _subscription = _secureSocksSocket.listen(
+            (data) {
+              // Add the data to the response controller.
+              _secureResponseController.add(data);
+            },
+            onError: (e) {
+              _secureResponseController.addError(
+                e is SocksException
+                    ? e
+                    : SocksConnectionException(
+                        message: 'SOCKS5 connection error: $e',
+                      ),
+              );
+            },
+            onDone: () {
+              // Close the response controller when the socket is closed.
+              _secureResponseController.close();
+            },
+          );
+        } catch (e) {
+          _sslUpgrading = false;
+          if (_cancelCompleter?.isCompleted == true) {
+            throw SocksCancelledException(
+              message: 'SOCKS5 connection cancelled during SSL upgrade.',
             );
-          },
-          onDone: () {
-            // Close the response controller when the socket is closed.
-            _secureResponseController.close();
-          },
+          }
+          rethrow;
+        }
+      }
+
+      // Check if cancelled between handshake completion and state transition.
+      if (_cancelCompleter?.isCompleted == true) {
+        throw SocksCancelledException(
+          message: 'SOCKS5 connection cancelled.',
         );
       }
 
       _state = ConnectionState.connected;
+      _cancelCompleter = null;
     } catch (e) {
-      _state = ConnectionState.error;
+      if (e is! SocksCancelledException) {
+        _state = ConnectionState.error;
+      }
+      _cancelCompleter = null;
       rethrow;
     }
   }
@@ -673,6 +718,35 @@ class SOCKSSocket {
       }
       _sslUpgraded = false;
     }
+  }
+
+  /// Cancels an in-flight connect operation. No-op if not connecting.
+  Future<void> cancel() async {
+    if (_state != ConnectionState.connecting) return;
+
+    final c = _cancelCompleter;
+    if (c == null || c.isCompleted) return;
+
+    c.completeError(
+      SocksCancelledException(
+        message: 'SOCKS5 connection cancelled.',
+      ),
+    );
+
+    // Destroy socket to force pending operations to fail.
+    if (_sslUpgrading) {
+      _sslUpgrading = false;
+    }
+    _socksSocket.destroy();
+
+    await _subscription?.cancel();
+    _outputController?.close();
+    if (!_responseController.isClosed) _responseController.close();
+    if (!_secureResponseController.isClosed) {
+      _secureResponseController.close();
+    }
+
+    _state = ConnectionState.disconnected;
   }
 
   /// Reconnects to the previously connected target.

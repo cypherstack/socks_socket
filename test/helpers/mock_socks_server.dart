@@ -21,6 +21,10 @@ class MockSocksServer {
 
   bool hangOnGreeting = false;
 
+  bool hangOnConnect = false;
+
+  bool hangAfterConnect = false;
+
   bool dropConnection = false;
 
   bool sendInvalidResponse = false;
@@ -190,6 +194,10 @@ class MockSocksServer {
       // --- Phase: Connect Command ---
       phase = phaseConnect;
 
+      if (hangOnConnect) {
+        return;
+      }
+
       while (true) {
         if (buffer.length >= 5) {
           final domainLen = buffer[4];
@@ -214,6 +222,10 @@ class MockSocksServer {
 
       await _sendResponse(
           client, [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+
+      if (hangAfterConnect) {
+        return;
+      }
 
       // Switch to echo mode.
       phase = phaseEcho;
