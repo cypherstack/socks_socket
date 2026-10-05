@@ -81,6 +81,53 @@ void main() {
     await expectLater(socket.write('late'), throwsStateError);
   });
 
+  test('peer EOF still delivers accepted writes', () async {
+    const size = 1024 * 1024;
+    final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(server.close);
+    final received = Completer<int>();
+    server.listen((peer) {
+      addTearDown(peer.destroy);
+      // Linux SO_RCVBUF: keep the upload queued in the sender.
+      peer.setRawOption(RawSocketOption.fromInt(1, 8, 65536));
+      final buffer = <int>[];
+      var tunnel = false;
+      var count = 0;
+      late StreamSubscription<List<int>> input;
+      input = peer.listen((bytes) async {
+        if (tunnel) {
+          count += bytes.length;
+          return;
+        }
+        buffer.addAll(bytes);
+        if (buffer.length == 3) {
+          peer.add([5, 0]);
+        } else if (buffer.length > 8 && buffer.length == 10 + buffer[7]) {
+          tunnel = true;
+          input.pause();
+          peer.add([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+          await peer.close();
+          await Future<void>.delayed(const Duration(milliseconds: 200));
+          input.resume();
+        }
+      }, onDone: () => received.complete(count));
+    });
+    final uploader = await SOCKSSocket.create(
+      proxyHost: InternetAddress.loopbackIPv4.address,
+      proxyPort: server.port,
+    );
+    addTearDown(() => uploader.close().catchError((_) {}));
+    await uploader.connect();
+    await uploader.connectTo('localhost', 80);
+    // Linux SO_SNDBUF.
+    uploader.socket.setRawOption(RawSocketOption.fromInt(1, 7, 65536));
+    final input = uploader.inputStream.drain<void>();
+    await uploader.write('A' * size);
+    await input;
+    expect(await received.future.timeout(const Duration(seconds: 5)), size);
+    expect(uploader.state, ConnectionState.disconnected);
+  }, testOn: 'linux');
+
   test('peer reset marks the connection failed', () async {
     await socket.connect();
     await socket.connectTo('localhost', 80);

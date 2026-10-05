@@ -236,8 +236,12 @@ class SOCKSSocket {
 
   static const int _maxHandshakeBuffer = 1024;
 
-  /// Cached output stream controller.
-  StreamController<List<int>>? _outputController;
+  _SocketOutputSink? _outputSink;
+  Future<void> _writeTail = Future<void>.value();
+  Object? _writeFailure;
+  StackTrace? _writeFailureStack;
+  Future<void>? _closeFuture;
+  bool _closing = false;
 
   /// Accept bad certificates (testing only).
   final bool _allowBadCertificates;
@@ -276,17 +280,23 @@ class SOCKSSocket {
       ? _secureResponseController.stream
       : _responseController.stream;
 
-  /// Provides a StreamSink compatible with List<int> for sending data.
-  StreamSink<List<int>> get outputStream {
-    _outputController ??= StreamController<List<int>>()
-      ..stream.listen((data) {
-        if (sslEnabled) {
-          _secureSocksSocket.add(data);
-        } else {
-          _socksSocket.add(data);
-        }
-      });
-    return _outputController!.sink;
+  StreamSink<List<int>> get outputStream => _outputSink ??= _newOutputSink();
+
+  _SocketOutputSink _newOutputSink() {
+    final generation = _generation;
+    final sink = _SocketOutputSink(_queueSinkWrite, (error, stack) {
+      if (generation == _generation) _failWrites(error, stack);
+    });
+    if (_writeFailure != null) sink._stop(_writeFailure!, _writeFailureStack!);
+    return sink;
+  }
+
+  Future<void> _queueSinkWrite(List<int> data) {
+    if (_state != ConnectionState.connected) {
+      throw StateError(
+          'Cannot write: socket is not connected (state: $_state)');
+    }
+    return _queueWrite(data, allowClosing: true);
   }
 
   /// Creates a SOCKS5 socket to the specified [proxyHost] and [proxyPort].
@@ -387,7 +397,7 @@ class SOCKSSocket {
       (data) {
         (_handshaking ? handshake : _responseController).add(data);
       },
-      onError: (e) {
+      onError: (Object e, StackTrace stack) {
         final error = e is SocksException
             ? e
             : SocksConnectionException(
@@ -395,23 +405,23 @@ class SOCKSSocket {
               );
         if (_handshaking && !handshake.isClosed) handshake.addError(error);
         if (!responses.isClosed) responses.addError(error);
-        if (_state == ConnectionState.connected) {
-          _state = ConnectionState.error;
-          _abandonConnection();
-        }
+        if (_state == ConnectionState.connected) _failWrites(error, stack);
       },
       onDone: () {
         // Close the response controller when the socket is closed.
         if (!handshake.isClosed) handshake.close();
         if (!_sslUpgraded) {
-          if (_state == ConnectionState.connected) {
-            _state = ConnectionState.disconnected;
-            _destroyTransport();
-          }
+          if (_state == ConnectionState.connected) _peerClosed();
           if (!responses.isClosed) responses.close();
         }
       },
     );
+  }
+
+  /// The peer stopped sending; writes already accepted are still delivered.
+  void _peerClosed() {
+    _state = ConnectionState.disconnected;
+    close().ignore();
   }
 
   void _destroyTransport() {
@@ -537,7 +547,9 @@ class SOCKSSocket {
   }
 
   Future<void> _connect() async {
-    if (_greetingStarted || _state != ConnectionState.disconnected) {
+    if (_greetingStarted ||
+        _closing ||
+        _state != ConnectionState.disconnected) {
       throw StateError(
           'Cannot connect: use reconnect() for another connection');
     }
@@ -598,7 +610,8 @@ class SOCKSSocket {
     }
     if (_state != ConnectionState.connecting ||
         !_greetingComplete ||
-        _requestStarted) {
+        _requestStarted ||
+        _closing) {
       throw StateError(
           'Cannot connectTo: must call connect() and await it before one connectTo()');
     }
@@ -667,26 +680,19 @@ class SOCKSSocket {
               // Add the data to the response controller.
               responses.add(data);
             },
-            onError: (e) {
-              if (!responses.isClosed) {
-                responses.addError(
-                  e is SocksException
-                      ? e
-                      : SocksConnectionException(
-                          message: 'SOCKS5 connection error: $e',
-                        ),
-                );
-              }
+            onError: (Object e, StackTrace stack) {
+              final error = e is SocksException
+                  ? e
+                  : SocksConnectionException(
+                      message: 'SOCKS5 connection error: $e',
+                    );
+              if (!responses.isClosed) responses.addError(error);
               if (_state == ConnectionState.connected) {
-                _state = ConnectionState.error;
-                _abandonConnection();
+                _failWrites(error, stack);
               }
             },
             onDone: () {
-              if (_state == ConnectionState.connected) {
-                _state = ConnectionState.disconnected;
-                _destroyTransport();
-              }
+              if (_state == ConnectionState.connected) _peerClosed();
               if (!responses.isClosed) responses.close();
             },
           );
@@ -726,26 +732,44 @@ class SOCKSSocket {
 
   /// Writes [object] to the socket. If [newline] is true, appends '\n'.
   Future<void> write(Object? object, {bool newline = false}) async {
-    // Don't write null.
     if (object == null) return;
+    final data = utf8.encode(object.toString());
+    await _queueWrite(newline ? [...data, 0x0A] : data);
+  }
 
-    if (_state != ConnectionState.connected) {
-      throw StateError(
-          'Cannot write: socket is not connected (state: $_state)');
+  Future<void> _queueWrite(List<int> data, {bool allowClosing = false}) {
+    if ((_closing && !allowClosing) || _state != ConnectionState.connected) {
+      return Future<void>.error(
+          StateError('Cannot write: socket is not connected (state: $_state)'));
     }
+    final bytes = List<int>.of(data);
+    final generation = _generation;
+    final writing = _writeTail.then((_) async {
+      if (_writeFailure != null) {
+        Error.throwWithStackTrace(_writeFailure!, _writeFailureStack!);
+      }
+      try {
+        socket.add(bytes);
+        await socket.flush().timeout(_operationTimeout);
+      } catch (e, stack) {
+        final error = e is SocksException || e is TimeoutException
+            ? e
+            : SocksConnectionException(message: 'SOCKS5 write failed: $e');
+        if (generation == _generation) _failWrites(error, stack);
+        Error.throwWithStackTrace(error, stack);
+      }
+    });
+    _writeTail =
+        writing.then<void>((_) {}, onError: (Object _, StackTrace __) {});
+    return writing;
+  }
 
-    // Write the data to the socket.
-    List<int> data = utf8.encode(object.toString());
-    if (newline) {
-      data = [...data, 0x0A]; // Append \n byte.
-    }
-    if (sslEnabled) {
-      _secureSocksSocket.add(data);
-      await _secureSocksSocket.flush().timeout(_operationTimeout);
-    } else {
-      _socksSocket.add(data);
-      await _socksSocket.flush().timeout(_operationTimeout);
-    }
+  void _failWrites(Object error, StackTrace stack) {
+    _writeFailure ??= error;
+    _writeFailureStack ??= stack;
+    _state = ConnectionState.error;
+    _outputSink?._stop(error, stack);
+    _abandonConnection();
   }
 
   /// Whether SSL upgrade consumed the raw socket.
@@ -755,23 +779,30 @@ class SOCKSSocket {
   ///
   /// Returns:
   ///  A Future that resolves to void.
-  Future<void> close() async {
-    _state = ConnectionState.disconnected;
+  Future<void> close() => _closeFuture ??= _close();
+
+  Future<void> _close() async {
+    _closing = true;
     final upgraded = sslEnabled && _sslUpgraded;
     final channel = upgraded ? _secureChannel : _channel;
-    final open = _nativeSocketOpen || (channel != null && !channel.isClosed);
     var flushed = false;
     // Ensure all data is sent before closing.
     try {
-      if (open) {
+      await _outputSink?.close().timeout(_operationTimeout);
+      await _writeTail;
+      final open = _nativeSocketOpen || (channel != null && !channel.isClosed);
+      if (open && _writeFailure == null) {
         await (upgraded ? _secureSocksSocket : _socksSocket)
             .flush()
             .timeout(_operationTimeout);
         flushed = true;
       }
+    } catch (error, stack) {
+      _outputSink?._stop(error, stack);
+      rethrow;
     } finally {
       _generation++;
-      _outputController?.close();
+      _state = ConnectionState.disconnected;
       if (flushed) {
         await (upgraded ? _secureSocksSocket : _socksSocket)
             .close()
@@ -810,7 +841,7 @@ class SOCKSSocket {
     _destroyTransport();
 
     await _subscription?.cancel();
-    _outputController?.close();
+    _outputSink?.close().ignore();
     _closeHandshakeResponses();
     if (!_responseController.isClosed) _responseController.close();
     if (!_secureResponseController.isClosed) {
@@ -859,7 +890,12 @@ class SOCKSSocket {
     _pendingApplicationData = null;
     _responseController = _newResponseController();
     _secureResponseController = _newResponseController();
-    _outputController = null;
+    _outputSink = null;
+    _writeTail = Future<void>.value();
+    _writeFailure = null;
+    _writeFailureStack = null;
+    _closeFuture = null;
+    _closing = false;
 
     try {
       await _init();
@@ -907,26 +943,99 @@ class SOCKSSocket {
     const String command =
         '{"jsonrpc":"2.0","id":"0","method":"server.features","params":[]}';
 
-    if (!sslEnabled) {
-      // Send the command to the proxy server.
-      _socksSocket.writeln(command);
+    await write(command, newline: true);
+  }
+}
 
-      // Wait for the response from the proxy server.
-      // var responseData = await _responseController.stream.first;
-      // if (kDebugMode) {
-      //   print("responseData: ${utf8.decode(responseData)}");
-      // }
+class _SocketOutputSink implements StreamSink<List<int>> {
+  final Future<void> Function(List<int>) _write;
+  final void Function(Object, StackTrace) _onError;
+  final _done = Completer<void>();
+  Future<void> _last = Future<void>.value();
+  bool _closed = false;
+  StreamSubscription<List<int>>? _source;
+  Completer<void>? _streamDone;
+
+  _SocketOutputSink(this._write, this._onError) {
+    _done.future.ignore();
+  }
+
+  @override
+  Future<void> get done => _done.future;
+
+  void _checkOpen() {
+    if (_closed) throw StateError('Output sink is closed');
+    if (_source != null) throw StateError('Output sink is bound to a stream');
+  }
+
+  void _stop(Object error, StackTrace stack) {
+    _closed = true;
+    _endStream(error, stack);
+    if (!_done.isCompleted) _done.completeError(error, stack);
+  }
+
+  void _endStream([Object? error, StackTrace? stack]) {
+    final completed = _streamDone;
+    _source?.cancel();
+    _source = null;
+    _streamDone = null;
+    if (completed == null) return;
+    if (error == null) {
+      completed.complete();
     } else {
-      // Send the command to the proxy server.
-      _secureSocksSocket.writeln(command);
-
-      // Wait for the response from the proxy server.
-      // var responseData = await _secureResponseController.stream.first;
-      // if (kDebugMode) {
-      //   print("secure responseData: ${utf8.decode(responseData)}");
-      // }
+      completed.completeError(error, stack);
     }
+  }
 
-    return;
+  void _failed(Object error, StackTrace stack) {
+    _stop(error, stack);
+    _onError(error, stack);
+  }
+
+  @override
+  void add(List<int> data) {
+    _checkOpen();
+    _last = _write(data);
+    _last.then<void>((_) {}, onError: _failed);
+  }
+
+  @override
+  void addError(Object error, [StackTrace? stackTrace]) {
+    _checkOpen();
+    _failed(error, stackTrace ?? StackTrace.current);
+  }
+
+  @override
+  Future<void> addStream(Stream<List<int>> stream) {
+    _checkOpen();
+    final completed = _streamDone = Completer<void>();
+    final source = _source = stream.listen(null, cancelOnError: true);
+    source
+      ..onData((List<int> data) {
+        source.pause();
+        try {
+          _last = _write(data);
+        } on StateError catch (error, stack) {
+          _endStream(error, stack);
+          return;
+        }
+        _last.then<void>((_) {
+          if (identical(_source, source)) source.resume();
+        }, onError: _failed);
+      })
+      ..onError(_failed)
+      ..onDone(() => _endStream());
+    return completed.future;
+  }
+
+  @override
+  Future<void> close() {
+    if (_closed) return done;
+    _closed = true;
+    final draining = _streamDone?.future ?? _last;
+    draining.then<void>((_) {
+      if (!_done.isCompleted) _done.complete();
+    }, onError: _failed);
+    return done;
   }
 }

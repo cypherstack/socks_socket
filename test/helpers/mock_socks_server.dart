@@ -11,6 +11,9 @@ class MockSocksServer {
 
   final List<dynamic> _clients = [];
 
+  void Function(List<int>)? onApplicationData;
+  bool echoApplicationData = true;
+
   bool rejectConnection = false;
 
   int replyCode = 0x01;
@@ -89,8 +92,9 @@ class MockSocksServer {
       client.listen(
         (data) {
           if (phase == phaseEcho) {
+            onApplicationData?.call(data);
             try {
-              client.add(data);
+              if (echoApplicationData) client.add(data);
             } catch (_) {}
             return;
           }
@@ -302,7 +306,8 @@ class MockSocksServer {
         if (event == RawSocketEvent.read) {
           final data = secureRaw.read();
           if (data != null && data.isNotEmpty) {
-            secureRaw.write(data);
+            onApplicationData?.call(data);
+            if (echoApplicationData) secureRaw.write(data);
           }
         }
       }, onError: (_) {}, onDone: () {});
