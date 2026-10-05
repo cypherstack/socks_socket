@@ -17,7 +17,7 @@
 - Tor circuit isolation via `isolationToken` parameter on `create()` and `reconnect()`. Sends token as SOCKS5 username/password auth (RFC 1929) to request separate Tor circuits.
 - `cancel()` method to abort in-flight `connect()`/`connectTo()` operations. No-op when already connected or disconnected.
 
-## 1.2.0
+## 1.2.0 (unpublished; included in 1.3.0)
 
 ### Bug Fixes
 
@@ -35,6 +35,14 @@
 - `write()` newline option for line-delimited protocols.
 - `ConnectionState` enum (disconnected, connecting, connected, error).
 - `reconnect()` to re-establish a dropped connection without creating a new instance.
+
+## 1.1.1
+
+- Example fixes only.
+
+## 1.1.0
+
+- Add `inputStream` and `outputStream`.
 
 ## 1.0.0
 
