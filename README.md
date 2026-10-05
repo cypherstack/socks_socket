@@ -83,3 +83,7 @@ await socksSocket.reconnect();
 await socksSocket.write('{"jsonrpc":"2.0","method":"server.ping","id":1}',
     newline: true);
 ```
+
+## HttpClient Connections
+
+`SocksConnection.start` returns a cancellable `ConnectionTask<Socket>` for `HttpClient.connectionFactory`; see `example/http/http_connection.dart`. Pass `tlsHost` for HTTPS. Requires Dart 3.5.

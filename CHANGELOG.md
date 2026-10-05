@@ -1,3 +1,7 @@
+## 1.4.0
+
+- Add `SocksConnection.start` for `HttpClient.connectionFactory` (Dart 3.5).
+
 ## 1.3.0
 
 ### Features

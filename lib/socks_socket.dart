@@ -2,47 +2,10 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-/// SOCKS5 reply codes as defined in RFC 1928 section 6.
-enum SocksReplyCode {
-  /// General SOCKS server failure.
-  generalFailure(0x01, 'General SOCKS server failure'),
+import 'src/reply_code.dart';
 
-  /// Connection not allowed by ruleset.
-  connectionNotAllowed(0x02, 'Connection not allowed by ruleset'),
-
-  /// Network unreachable.
-  networkUnreachable(0x03, 'Network unreachable'),
-
-  /// Host unreachable.
-  hostUnreachable(0x04, 'Host unreachable'),
-
-  /// Connection refused.
-  connectionRefused(0x05, 'Connection refused'),
-
-  /// TTL expired.
-  ttlExpired(0x06, 'TTL expired'),
-
-  /// Command not supported.
-  commandNotSupported(0x07, 'Command not supported'),
-
-  /// Address type not supported.
-  addressTypeNotSupported(0x08, 'Address type not supported');
-
-  /// RFC 1928 byte value.
-  final int byte;
-
-  final String description;
-
-  const SocksReplyCode(this.byte, this.description);
-
-  /// Lookup by byte value. Returns null for unknown or success (0x00).
-  static SocksReplyCode? fromByte(int byte) {
-    for (final code in values) {
-      if (code.byte == byte) return code;
-    }
-    return null;
-  }
-}
+export 'socks_connection.dart';
+export 'src/reply_code.dart';
 
 /// Base exception for SOCKS5 errors. Sealed; catch subtypes or [Exception].
 sealed class SocksException implements Exception {
@@ -267,8 +230,7 @@ class SOCKSSocket {
     bool allowBadCertificates = false,
   }) async {
     // RFC 1929 ULEN/PLEN max 255 bytes.
-    if (isolationToken != null &&
-        utf8.encode(isolationToken).length > 255) {
+    if (isolationToken != null && utf8.encode(isolationToken).length > 255) {
       throw ArgumentError.value(
         isolationToken,
         'isolationToken',
@@ -277,8 +239,13 @@ class SOCKSSocket {
     }
 
     // Create a SOCKS socket instance.
-    var instance = SOCKSSocket._(proxyHost, proxyPort, sslEnabled,
-        isolationToken, handshakeTimeout, operationTimeout,
+    var instance = SOCKSSocket._(
+        proxyHost,
+        proxyPort,
+        sslEnabled,
+        isolationToken,
+        handshakeTimeout,
+        operationTimeout,
         allowBadCertificates);
 
     // Initialize the SOCKS socket.

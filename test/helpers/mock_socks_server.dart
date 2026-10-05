@@ -47,8 +47,7 @@ class MockSocksServer {
 
     if (sslEnabled) {
       // RawServerSocket for SSL to avoid subscription conflicts.
-      _rawServer =
-          await RawServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      _rawServer = await RawServerSocket.bind(InternetAddress.loopbackIPv4, 0);
       _rawServer!.listen(
         (rawClient) => _handleRawClient(rawClient),
         onError: (_) {},
@@ -220,8 +219,7 @@ class MockSocksServer {
         return;
       }
 
-      await _sendResponse(
-          client, [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+      await _sendResponse(client, [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
 
       if (hangAfterConnect) {
         return;

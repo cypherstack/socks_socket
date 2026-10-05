@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:test/test.dart';
 import 'package:socks_socket/socks_socket.dart';
 import 'helpers/mock_socks_server.dart';
+import 'helpers/test_certificates.dart';
 
 /// Helper: create, connect, and connectTo in one call.
 Future<SOCKSSocket> createAndConnect(
@@ -27,6 +28,8 @@ Future<SOCKSSocket> createAndConnect(
 }
 
 void main() {
+  final certificates = TestCertificates.generate();
+
   group('Happy path', () {
     late MockSocksServer server;
 
@@ -253,9 +256,7 @@ void main() {
     late SecurityContext serverContext;
 
     setUp(() async {
-      serverContext = SecurityContext()
-        ..useCertificateChain('test/helpers/test_certs/server.crt')
-        ..usePrivateKey('test/helpers/test_certs/server.key');
+      serverContext = certificates.serverContext();
 
       server = MockSocksServer()
         ..sslEnabled = true
@@ -789,7 +790,8 @@ void main() {
       await socket.close();
     });
 
-    test('connect with token to no-auth server proceeds without sub-negotiation',
+    test(
+        'connect with token to no-auth server proceeds without sub-negotiation',
         () async {
       // Server selects no-auth even though client offers auth.
       server.requireAuth = false;
@@ -915,7 +917,8 @@ void main() {
 
       // Capture error so it doesn't leak.
       Object? caughtError;
-      final connectToFuture = socket.connectTo('example.com', 80).catchError((e) {
+      final connectToFuture =
+          socket.connectTo('example.com', 80).catchError((e) {
         caughtError = e;
       });
 

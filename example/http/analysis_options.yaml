@@ -1,0 +1,2 @@
+# This standalone Dart example does not need the Flutter example's dependencies.
+include: ../../analysis_options.yaml
