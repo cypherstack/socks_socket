@@ -65,12 +65,14 @@ class SocksCancelledException extends SocksException {
 }
 
 /// Connection state of a [SOCKSSocket].
-enum ConnectionState {
+enum SocksSocketState {
   disconnected,
   connecting,
   connected,
   error,
 }
+
+typedef ConnectionState = SocksSocketState;
 
 /// A SOCKS5 socket.
 ///
@@ -166,10 +168,10 @@ class SOCKSSocket {
   /// Broadcast: each handshake step listens and cancels in turn.
   StreamController<List<int>>? _handshakeResponses;
 
-  bool get _handshaking => _state != ConnectionState.connected;
+  bool get _handshaking => _state != SocksSocketState.connected;
 
   void _resumeApplicationInput() {
-    if (_state != ConnectionState.connected ||
+    if (_state != SocksSocketState.connected ||
         !responseController.hasListener) {
       return;
     }
@@ -185,7 +187,7 @@ class SOCKSSocket {
   }
 
   void _pauseApplicationInput() {
-    if (_state == ConnectionState.connected) _pauseInput();
+    if (_state == SocksSocketState.connected) _pauseInput();
   }
 
   void _pauseInput() {
@@ -216,11 +218,11 @@ class SOCKSSocket {
   final bool sslEnabled;
 
   /// Current connection state.
-  ConnectionState _state = ConnectionState.disconnected;
+  SocksSocketState _state = SocksSocketState.disconnected;
 
   /// Peer close or failure is noticed only while [inputStream] has a listener;
   /// until then a [write] to a dead peer may appear to succeed.
-  ConnectionState get state => _state;
+  SocksSocketState get state => _state;
 
   /// Target domain for [reconnect].
   String? _targetDomain;
@@ -292,7 +294,7 @@ class SOCKSSocket {
   }
 
   Future<void> _queueSinkWrite(List<int> data) {
-    if (_state != ConnectionState.connected) {
+    if (_state != SocksSocketState.connected) {
       throw StateError(
           'Cannot write: socket is not connected (state: $_state)');
     }
@@ -405,13 +407,13 @@ class SOCKSSocket {
               );
         if (_handshaking && !handshake.isClosed) handshake.addError(error);
         if (!responses.isClosed) responses.addError(error);
-        if (_state == ConnectionState.connected) _failWrites(error, stack);
+        if (_state == SocksSocketState.connected) _failWrites(error, stack);
       },
       onDone: () {
         // Close the response controller when the socket is closed.
         if (!handshake.isClosed) handshake.close();
         if (!_sslUpgraded) {
-          if (_state == ConnectionState.connected) _peerClosed();
+          if (_state == SocksSocketState.connected) _peerClosed();
           if (!responses.isClosed) responses.close();
         }
       },
@@ -420,7 +422,7 @@ class SOCKSSocket {
 
   /// The peer stopped sending; writes already accepted are still delivered.
   void _peerClosed() {
-    _state = ConnectionState.disconnected;
+    _state = SocksSocketState.disconnected;
     close().ignore();
   }
 
@@ -549,13 +551,13 @@ class SOCKSSocket {
   Future<void> _connect() async {
     if (_greetingStarted ||
         _closing ||
-        _state != ConnectionState.disconnected) {
+        _state != SocksSocketState.disconnected) {
       throw StateError(
           'Cannot connect: use reconnect() for another connection');
     }
     _greetingStarted = true;
     _cancelCompleter = Completer<Never>()..future.ignore();
-    _state = ConnectionState.connecting;
+    _state = SocksSocketState.connecting;
     try {
       await negotiateSocks(
         write: _writeHandshake,
@@ -570,7 +572,7 @@ class SOCKSSocket {
       }
       _greetingComplete = true;
     } on SocksProtocolFailure catch (error) {
-      _state = ConnectionState.error;
+      _state = SocksSocketState.error;
       _abandonConnection();
       _cancelCompleter = null;
       throw SocksHandshakeException(
@@ -579,7 +581,7 @@ class SOCKSSocket {
           message: 'SOCKS5 handshake failed: ${error.message}');
     } catch (e) {
       if (e is! SocksCancelledException) {
-        _state = ConnectionState.error;
+        _state = SocksSocketState.error;
         _abandonConnection();
       }
       _cancelCompleter = null;
@@ -608,7 +610,7 @@ class SOCKSSocket {
     if (_cancelled) {
       throw SocksCancelledException(message: 'SOCKS5 connection cancelled.');
     }
-    if (_state != ConnectionState.connecting ||
+    if (_state != SocksSocketState.connecting ||
         !_greetingComplete ||
         _requestStarted ||
         _closing) {
@@ -687,12 +689,12 @@ class SOCKSSocket {
                       message: 'SOCKS5 connection error: $e',
                     );
               if (!responses.isClosed) responses.addError(error);
-              if (_state == ConnectionState.connected) {
+              if (_state == SocksSocketState.connected) {
                 _failWrites(error, stack);
               }
             },
             onDone: () {
-              if (_state == ConnectionState.connected) _peerClosed();
+              if (_state == SocksSocketState.connected) _peerClosed();
               if (!responses.isClosed) responses.close();
             },
           );
@@ -717,12 +719,12 @@ class SOCKSSocket {
         );
       }
 
-      _state = ConnectionState.connected;
+      _state = SocksSocketState.connected;
       _cancelCompleter = null;
       _resumeApplicationInput();
     } catch (e) {
       if (e is! SocksCancelledException) {
-        _state = ConnectionState.error;
+        _state = SocksSocketState.error;
         _abandonConnection();
       }
       _cancelCompleter = null;
@@ -738,7 +740,7 @@ class SOCKSSocket {
   }
 
   Future<void> _queueWrite(List<int> data, {bool allowClosing = false}) {
-    if ((_closing && !allowClosing) || _state != ConnectionState.connected) {
+    if ((_closing && !allowClosing) || _state != SocksSocketState.connected) {
       return Future<void>.error(
           StateError('Cannot write: socket is not connected (state: $_state)'));
     }
@@ -767,7 +769,7 @@ class SOCKSSocket {
   void _failWrites(Object error, StackTrace stack) {
     _writeFailure ??= error;
     _writeFailureStack ??= stack;
-    _state = ConnectionState.error;
+    _state = SocksSocketState.error;
     _outputSink?._stop(error, stack);
     _abandonConnection();
   }
@@ -802,7 +804,7 @@ class SOCKSSocket {
       rethrow;
     } finally {
       _generation++;
-      _state = ConnectionState.disconnected;
+      _state = SocksSocketState.disconnected;
       if (flushed) {
         await (upgraded ? _secureSocksSocket : _socksSocket)
             .close()
@@ -824,13 +826,13 @@ class SOCKSSocket {
   /// Cancels an in-flight connect operation. No-op if not connecting.
   /// The instance cannot be reused afterwards; create a new socket.
   Future<void> cancel() async {
-    if (_state != ConnectionState.connecting) return;
+    if (_state != SocksSocketState.connecting) return;
 
     final c = _cancelCompleter;
     if (c == null || c.isCompleted) return;
 
     _cancelled = true;
-    _state = ConnectionState.disconnected;
+    _state = SocksSocketState.disconnected;
     c.completeError(
       SocksCancelledException(
         message: 'SOCKS5 connection cancelled.',
@@ -848,7 +850,7 @@ class SOCKSSocket {
       _secureResponseController.close();
     }
 
-    _state = ConnectionState.disconnected;
+    _state = SocksSocketState.disconnected;
   }
 
   void _closeHandshakeResponses() {
@@ -903,8 +905,8 @@ class SOCKSSocket {
       await _connectTo(_targetDomain!, _targetPort!);
     } catch (error) {
       _state = error is SocksCancelledException
-          ? ConnectionState.disconnected
-          : ConnectionState.error;
+          ? SocksSocketState.disconnected
+          : SocksSocketState.error;
       _abandonConnection();
       rethrow;
     }

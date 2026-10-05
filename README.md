@@ -25,7 +25,7 @@ SOCKS version 5 sockets for Dart and Flutter, *eg.* ElectrumX and/or Fulcrum ove
 See `socks_socket.dart` itself for properties and methods and the example for reference.
 
 ```dart
-import 'package:socks_socket/socks_socket.dart';
+import 'package:socks_socket/socks.dart';
 
 // Instantiate a socks socket at localhost and on the port selected by the tor service.
 var socksSocket = await SOCKSSocket.create(
@@ -45,6 +45,8 @@ await socksSocket.connectTo('bitcoin.stackwallet.com', 50002);
 // Send a server features command to the socket, see method for more specific usage example.
 await socksSocket.sendServerFeaturesCommand();
 ```
+
+`socks.dart` omits the `ConnectionState` alias for use alongside Flutter.
 
 ## Timeout Configuration
 
