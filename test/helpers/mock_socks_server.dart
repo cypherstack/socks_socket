@@ -37,6 +37,8 @@ class MockSocksServer {
 
   String? lastPassword;
 
+  List<int>? lastOfferedMethods;
+
   bool sslEnabled = false;
 
   SecurityContext? securityContext;
@@ -44,6 +46,7 @@ class MockSocksServer {
   Future<void> start() async {
     lastUsername = null;
     lastPassword = null;
+    lastOfferedMethods = null;
 
     if (sslEnabled) {
       // RawServerSocket for SSL to avoid subscription conflicts.
@@ -121,6 +124,7 @@ class MockSocksServer {
 
       // Extract offered methods.
       final methods = buffer.sublist(2, greetingLen);
+      lastOfferedMethods = methods;
       final offersAuth = methods.contains(0x02);
 
       if (requireAuth && offersAuth) {

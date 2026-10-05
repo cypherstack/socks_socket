@@ -4,14 +4,17 @@ import 'dart:io';
 
 import 'package:test/test.dart';
 import 'package:socks_socket/socks_socket.dart';
+import 'package:socks_socket/src/connection_socket.dart';
 import 'helpers/mock_socks_server.dart';
 import 'helpers/test_certificates.dart';
+import 'helpers/tunnel_proxy.dart';
 
 /// Helper: create, connect, and connectTo in one call.
 Future<SOCKSSocket> createAndConnect(
   MockSocksServer server, {
   bool ssl = false,
   bool allowBadCerts = false,
+  SecurityContext? trust,
   Duration? handshakeTimeout,
 }) async {
   final socket = await SOCKSSocket.create(
@@ -21,6 +24,7 @@ Future<SOCKSSocket> createAndConnect(
     handshakeTimeout: handshakeTimeout ?? const Duration(seconds: 5),
     operationTimeout: const Duration(seconds: 5),
     allowBadCertificates: allowBadCerts,
+    securityContext: trust,
   );
   await socket.connect();
   await socket.connectTo('localhost', 1234);
@@ -29,6 +33,62 @@ Future<SOCKSSocket> createAndConnect(
 
 void main() {
   final certificates = TestCertificates.generate();
+
+  for (final size in [3, 4096]) {
+    test('preserves $size application bytes sent with the CONNECT reply',
+        () async {
+      final payload = List<int>.generate(size, (i) => i % 251);
+      final proxy = TunnelProxy(initialData: payload);
+      await proxy.start();
+      addTearDown(proxy.close);
+      final socket = await SOCKSSocket.create(
+          proxyHost: '127.0.0.1', proxyPort: proxy.port);
+      addTearDown(socket.close);
+      await socket.connect();
+      await socket.connectTo('example.invalid', 80);
+      await proxy.replyFlushed.future;
+      final laterData = [251, 252, 253];
+      proxy.sockets.first.add(laterData);
+      await proxy.sockets.first.flush();
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(
+          await socket.inputStream
+              .expand((b) => b)
+              .take(size + laterData.length)
+              .toList()
+              .timeout(const Duration(seconds: 2)),
+          [...payload, ...laterData]);
+    });
+  }
+
+  for (final token in [null, 'circuit']) {
+    test(
+        'an inputStream listener attached before connecting sees only '
+        'application data${token == null ? '' : ' (with isolation token)'}',
+        () async {
+      final payload = [7, 7, 7];
+      final proxy = TunnelProxy(initialData: payload);
+      await proxy.start();
+      addTearDown(proxy.close);
+      final socket = await SOCKSSocket.create(
+          proxyHost: '127.0.0.1', proxyPort: proxy.port, isolationToken: token);
+      addTearDown(socket.close);
+      final received = <int>[];
+      socket.inputStream.listen(received.addAll);
+      await socket.connect();
+      await socket.connectTo('example.invalid', 80);
+      await proxy.replyFlushed.future;
+      final laterData = [8, 9];
+      proxy.sockets.first.add(laterData);
+      await proxy.sockets.first.flush();
+      final deadline = DateTime.now().add(const Duration(seconds: 2));
+      while (received.length < payload.length + laterData.length &&
+          DateTime.now().isBefore(deadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      expect(received, [...payload, ...laterData]);
+    });
+  }
 
   group('Happy path', () {
     late MockSocksServer server;
@@ -285,7 +345,7 @@ void main() {
       final socket = await createAndConnect(
         server,
         ssl: true,
-        allowBadCerts: true,
+        trust: certificates.clientContext(),
       );
       try {
         final completer = Completer<List<int>>();
@@ -801,6 +861,7 @@ void main() {
         proxyHost: InternetAddress.loopbackIPv4.address,
         proxyPort: server.port,
         isolationToken: 'some-token',
+        requireIsolation: false,
         handshakeTimeout: const Duration(seconds: 5),
       );
       await socket.connect();
@@ -852,6 +913,63 @@ void main() {
       expect(server.lastUsername, 'circuit-2');
       expect(server.lastPassword, 'circuit-2');
       await socket.close();
+    });
+
+    test('requireIsolation offers only auth and rejects no-auth downgrade',
+        () async {
+      server.requireAuth = false;
+      await server.start();
+
+      final socket = await SOCKSSocket.create(
+        proxyHost: InternetAddress.loopbackIPv4.address,
+        proxyPort: server.port,
+        isolationToken: 'strict-token',
+        requireIsolation: true,
+        handshakeTimeout: const Duration(seconds: 5),
+      );
+      await expectLater(
+        socket.connect,
+        throwsA(isA<SocksHandshakeException>().having(
+          (e) => e.toString(),
+          'message',
+          contains('isolation is required'),
+        )),
+      );
+      expect(server.lastOfferedMethods, [0x02]);
+      expect(server.lastUsername, isNull);
+      expect(socket.state, ConnectionState.error);
+      await socket.close();
+    });
+
+    test('requireIsolation connects when the proxy selects auth', () async {
+      server.requireAuth = true;
+      await server.start();
+
+      final socket = await SOCKSSocket.create(
+        proxyHost: InternetAddress.loopbackIPv4.address,
+        proxyPort: server.port,
+        isolationToken: 'strict-token',
+        requireIsolation: true,
+        handshakeTimeout: const Duration(seconds: 5),
+      );
+      await socket.connect();
+      await socket.connectTo('target.onion', 50001);
+      expect(socket.state, ConnectionState.connected);
+      expect(server.lastOfferedMethods, [0x02]);
+      expect(server.lastUsername, 'strict-token');
+      await socket.close();
+    });
+
+    test('requireIsolation without isolationToken throws ArgumentError',
+        () async {
+      await expectLater(
+        () => SOCKSSocket.create(
+          proxyHost: InternetAddress.loopbackIPv4.address,
+          proxyPort: 1234,
+          requireIsolation: true,
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
     });
 
     test('isolationToken exceeding 255 UTF-8 bytes throws ArgumentError',
@@ -983,6 +1101,274 @@ void main() {
       expect(socket.state, ConnectionState.disconnected);
       await socket.cancel(); // Double cancel is safe.
       expect(socket.state, ConnectionState.disconnected);
+    });
+  });
+
+  group('Protocol validation', () {
+    Future<SOCKSSocket> open(TunnelProxy proxy, {String? token}) async {
+      await proxy.start();
+      addTearDown(proxy.close);
+      final socket = await SOCKSSocket.create(
+        proxyHost: InternetAddress.loopbackIPv4.address,
+        proxyPort: proxy.port,
+        isolationToken: token,
+        handshakeTimeout: const Duration(seconds: 5),
+      );
+      addTearDown(() => socket.close().catchError((_) {}));
+      return socket;
+    }
+
+    final handshakeFailure = throwsA(isA<SocksHandshakeException>());
+
+    for (final (name, reply) in [
+      ('wrong version', [4, 0]),
+      ('trailing data', [5, 0, 0]),
+    ]) {
+      test('rejects greeting reply with $name', () async {
+        final socket = await open(TunnelProxy(greetingReply: reply));
+        await expectLater(socket.connect(), handshakeFailure);
+        expect(socket.state, ConnectionState.error);
+      });
+    }
+
+    test('rejects authentication reply with wrong version', () async {
+      final socket =
+          await open(TunnelProxy(authReply: [5, 0]), token: 'circuit');
+      await expectLater(socket.connect(), handshakeFailure);
+    });
+
+    for (final (name, reply) in [
+      ('wrong version', [4, 0, 0, 1, 0, 0, 0, 0, 0, 0]),
+      ('nonzero reserved byte', [5, 0, 1, 1, 0, 0, 0, 0, 0, 0]),
+      ('unknown address type', [5, 0, 0, 2, 0, 0, 0, 0, 0, 0]),
+      ('empty domain', [5, 0, 0, 3, 0, 0, 0]),
+    ]) {
+      test('rejects connect reply with $name promptly', () async {
+        final socket = await open(TunnelProxy(connectReply: reply));
+        await socket.connect();
+        final stopwatch = Stopwatch()..start();
+        await expectLater(
+            socket.connectTo('example.com', 443), handshakeFailure);
+        expect(stopwatch.elapsed, lessThan(const Duration(seconds: 2)));
+        expect(socket.state, ConnectionState.error);
+      });
+    }
+
+    test('rejected CONNECT ends inputStream for early and late listeners',
+        () async {
+      final socket = await open(TunnelProxy(replyCode: 5));
+      final early = socket.inputStream.toList();
+      await socket.connect();
+      await expectLater(socket.connectTo('example.com', 443),
+          throwsA(isA<SocksRequestException>()));
+      await early.timeout(const Duration(seconds: 2));
+      await socket.inputStream.toList().timeout(const Duration(seconds: 2));
+      expect(socket.state, ConnectionState.error);
+    });
+
+    test('reports a short failure reply without waiting for the address',
+        () async {
+      final socket = await open(TunnelProxy(connectReply: [5, 4, 0, 1]));
+      await socket.connect();
+      await expectLater(
+        socket.connectTo('example.com', 443),
+        throwsA(isA<SocksRequestException>().having(
+            (e) => e.replyCode, 'replyCode', SocksReplyCode.hostUnreachable)),
+      );
+    });
+
+    test('sends the hostname for the proxy to resolve', () async {
+      final proxy = TunnelProxy();
+      final socket = await open(proxy);
+      await socket.connect();
+      await socket.connectTo('unresolvable.invalid', 8333);
+      expect(proxy.targetType, 3);
+      expect(proxy.target, 'unresolvable.invalid');
+      expect(proxy.targetPort, 8333);
+    });
+
+    test('rejects destinations that do not fit the request', () async {
+      final proxy = TunnelProxy();
+      final socket = await open(proxy);
+      await socket.connect();
+      for (final domain in ['', 'a' * 256, 'unicode.é', 'has space', 'a\nb']) {
+        await expectLater(
+            socket.connectTo(domain, 443), throwsA(isA<ArgumentError>()));
+      }
+      for (final port in [0, 65536, -1]) {
+        await expectLater(socket.connectTo('example.com', port),
+            throwsA(isA<ArgumentError>()));
+      }
+      expect(socket.state, ConnectionState.connecting);
+      await socket.connectTo('a' * 255, 443);
+      expect(proxy.target, 'a' * 255);
+    });
+
+    test('reconnect rejects an oversized isolation token', () async {
+      final proxy = TunnelProxy();
+      final socket = await open(proxy, token: 'circuit-1');
+      await socket.connect();
+      await socket.connectTo('example.com', 443);
+      await expectLater(socket.reconnect(isolationToken: 'b' * 256),
+          throwsA(isA<ArgumentError>()));
+      expect(socket.state, ConnectionState.connected);
+      expect(proxy.connections, 1);
+    });
+  });
+
+  group('Transport cleanup', () {
+    for (final size in [1024, 65536, 2 * 1024 * 1024]) {
+      test('SSL close delivers all $size bytes after write', () async {
+        final server =
+            await RawServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+        addTearDown(server.close);
+        final received = Completer<List<int>>()..future.ignore();
+        server.listen((raw) async {
+          addTearDown(raw.close);
+          try {
+            final channel = RawChannel(raw);
+            final greeting = await channel.read(2);
+            await channel.read(greeting[1]);
+            await channel.write([5, 0]);
+            final request = await channel.read(5);
+            await channel.read(request[4] + 2);
+            await channel.write([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+            final secure = await RawSecureSocket.secureServer(
+                raw, certificates.serverContext(),
+                subscription: channel.detach());
+            addTearDown(secure.close);
+            received.complete(await RawChannel(secure)
+                .socket()
+                .fold<List<int>>([], (bytes, chunk) => bytes..addAll(chunk)));
+          } catch (error, stack) {
+            received.completeError(error, stack);
+          }
+        });
+
+        final socket = await SOCKSSocket.create(
+          proxyHost: InternetAddress.loopbackIPv4.address,
+          proxyPort: server.port,
+          sslEnabled: true,
+          securityContext: certificates.clientContext(),
+        );
+        addTearDown(socket.close);
+        await socket.connect();
+        await socket.connectTo('localhost', 443);
+        final payload = List<int>.generate(size, (i) => 32 + i % 95);
+        await socket.write(ascii.decode(payload));
+        await socket.close();
+        expect(await received.future.timeout(const Duration(seconds: 10)),
+            payload);
+      });
+    }
+
+    Future<(TunnelProxy, SOCKSSocket)> open(
+      TunnelProxy proxy, {
+      bool ssl = false,
+      Duration handshakeTimeout = const Duration(seconds: 5),
+    }) async {
+      await proxy.start();
+      addTearDown(proxy.close);
+      final socket = await SOCKSSocket.create(
+        proxyHost: InternetAddress.loopbackIPv4.address,
+        proxyPort: proxy.port,
+        sslEnabled: ssl,
+        handshakeTimeout: handshakeTimeout,
+      );
+      addTearDown(() => socket.close().catchError((_) {}));
+      return (proxy, socket);
+    }
+
+    test('stalled SSL handshake times out and closes the connection', () async {
+      final (proxy, socket) = await open(TunnelProxy(),
+          ssl: true, handshakeTimeout: const Duration(milliseconds: 200));
+      await socket.connect();
+      final stopwatch = Stopwatch()..start();
+      await expectLater(
+          socket.connectTo('localhost', 443), throwsA(isA<TimeoutException>()));
+      expect(stopwatch.elapsed, lessThan(const Duration(seconds: 2)));
+      expect((await proxy.applicationData.future).first, 22);
+      expect(socket.state, ConnectionState.error);
+      await proxy.disconnected.future.timeout(const Duration(seconds: 2));
+    });
+
+    test('cancel during SSL handshake closes the connection', () async {
+      final (proxy, socket) = await open(TunnelProxy(), ssl: true);
+      await socket.connect();
+      final connecting = expectLater(socket.connectTo('localhost', 443),
+          throwsA(isA<SocksCancelledException>()));
+      await proxy.applicationData.future;
+      await socket.cancel();
+      await connecting.timeout(const Duration(seconds: 2));
+      expect(socket.state, ConnectionState.disconnected);
+      await proxy.disconnected.future.timeout(const Duration(seconds: 2));
+    });
+
+    test('handshake failure closes the connection without close()', () async {
+      final (proxy, socket) = await open(TunnelProxy(stallAt: 0),
+          handshakeTimeout: const Duration(milliseconds: 100));
+      await expectLater(socket.connect(), throwsA(isA<TimeoutException>()));
+      await proxy.disconnected.future.timeout(const Duration(seconds: 2));
+      await socket.close();
+    });
+
+    test('proxy closing during the handshake fails without waiting', () async {
+      final server = MockSocksServer()..dropConnection = true;
+      await server.start();
+      addTearDown(server.stop);
+      final socket = await SOCKSSocket.create(
+        proxyHost: InternetAddress.loopbackIPv4.address,
+        proxyPort: server.port,
+        handshakeTimeout: const Duration(seconds: 10),
+      );
+      final stopwatch = Stopwatch()..start();
+      await expectLater(
+          socket.connect(), throwsA(isA<SocksConnectionException>()));
+      expect(stopwatch.elapsed, lessThan(const Duration(seconds: 2)));
+      await socket.close();
+    });
+
+    test('remote close ends the input stream', () async {
+      final upstream = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(upstream.close);
+      upstream.listen((peer) => peer.close());
+      final (_, socket) = await open(TunnelProxy(upstreamPort: upstream.port));
+      await socket.connect();
+      await socket.connectTo('example.com', 80);
+      await socket.inputStream
+          .drain<void>()
+          .timeout(const Duration(seconds: 2));
+    });
+
+    test('SSL verifies the server against the supplied context', () async {
+      final server = MockSocksServer()
+        ..sslEnabled = true
+        ..securityContext = certificates.serverContext();
+      await server.start();
+      addTearDown(server.stop);
+      Future<SOCKSSocket> connect(String host, SecurityContext? trust) async {
+        final socket = await SOCKSSocket.create(
+          proxyHost: InternetAddress.loopbackIPv4.address,
+          proxyPort: server.port,
+          sslEnabled: true,
+          securityContext: trust,
+          handshakeTimeout: const Duration(seconds: 5),
+        );
+        addTearDown(() => socket.close().catchError((_) {}));
+        await socket.connect();
+        await socket.connectTo(host, 443);
+        return socket;
+      }
+
+      final trust = certificates.clientContext();
+      final socket = await connect('localhost', trust);
+      final echoed = socket.inputStream.expand((b) => b).take(8).toList();
+      await socket.write('verified');
+      expect(utf8.decode(await echoed), 'verified');
+      await expectLater(
+          connect('localhost', null), throwsA(isA<HandshakeException>()));
+      await expectLater(
+          connect('wrong.invalid', trust), throwsA(isA<HandshakeException>()));
     });
   });
 }

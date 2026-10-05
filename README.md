@@ -66,12 +66,17 @@ var socksSocket = await SOCKSSocket.create(
 var socksSocket = await SOCKSSocket.create(
     proxyHost: InternetAddress.loopbackIPv4.address,
     proxyPort: Tor.instance.port,
+    sslEnabled: true,
     isolationToken: 'wallet-btc-001',
 );
+await socksSocket.connect();
+await socksSocket.connectTo('bitcoin.stackwallet.com', 50002);
 
-// Reconnect with a different token to rotate circuits.
+// Reconnect with a different token; requires an earlier connectTo().
 await socksSocket.reconnect(isolationToken: 'wallet-btc-002');
 ```
+
+Tokens are sent as SOCKS5 credentials. A proxy selecting no-auth is rejected unless `requireIsolation: false`.
 
 ## Reconnection
 
@@ -83,6 +88,8 @@ await socksSocket.reconnect();
 await socksSocket.write('{"jsonrpc":"2.0","method":"server.ping","id":1}',
     newline: true);
 ```
+
+`cancel()` or `close()` during connect spends the instance; create a new one. Peer close is noticed, and `state` updated, only while `inputStream` has a listener.
 
 ## HttpClient Connections
 

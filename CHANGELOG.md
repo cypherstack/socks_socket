@@ -1,6 +1,10 @@
 ## 1.4.0
 
 - Add `SocksConnection.start` for `HttpClient.connectionFactory` (Dart 3.5).
+- Validate targets, tokens and proxy replies.
+- Keep handshake replies out of `inputStream`; buffer input until a listener attaches.
+- Bound SSL handshakes; add `securityContext` and `requireIsolation` (defaults to true with a token: a no-auth proxy is now rejected).
+- Reject overlapping connect calls; track peer close in `state`.
 
 ## 1.3.0
 

@@ -2,7 +2,9 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'src/connection_socket.dart';
 import 'src/reply_code.dart';
+import 'src/socks_protocol.dart';
 
 export 'socks_connection.dart';
 export 'src/reply_code.dart';
@@ -133,13 +135,69 @@ class SOCKSSocket {
   /// A wrapper around the _socksSocket that enables SSL connections.
   late Socket _secureSocksSocket;
 
+  bool _nativeSocketOpen = false;
+
+  RawChannel? _channel;
+
+  RawChannel? _secureChannel;
+
   /// A StreamController that listens to the _socksSocket and broadcasts.
-  StreamController<List<int>> _responseController =
-      StreamController.broadcast();
+  late StreamController<List<int>> _responseController =
+      _newResponseController();
+
+  /// Bumped on teardown so a replaced connection's callbacks are ignored.
+  int _generation = 0;
+
+  StreamController<List<int>> _newResponseController() {
+    final generation = _generation;
+    return StreamController<List<int>>.broadcast(
+      onListen: () {
+        if (generation == _generation) _resumeApplicationInput();
+      },
+      onCancel: () {
+        if (generation == _generation) _pauseApplicationInput();
+      },
+    );
+  }
+
+  List<int>? _pendingApplicationData;
+  bool _applicationInputPaused = false;
+
+  /// Broadcast: each handshake step listens and cancels in turn.
+  StreamController<List<int>>? _handshakeResponses;
+
+  bool get _handshaking => _state != ConnectionState.connected;
+
+  void _resumeApplicationInput() {
+    if (_state != ConnectionState.connected ||
+        !responseController.hasListener) {
+      return;
+    }
+    final pending = _pendingApplicationData;
+    _pendingApplicationData = null;
+    if (pending != null && pending.isNotEmpty) {
+      _responseController.add(pending);
+    }
+    if (_applicationInputPaused) {
+      _applicationInputPaused = false;
+      _subscription?.resume();
+    }
+  }
+
+  void _pauseApplicationInput() {
+    if (_state == ConnectionState.connected) _pauseInput();
+  }
+
+  void _pauseInput() {
+    if (!_applicationInputPaused) {
+      _applicationInputPaused = true;
+      _subscription?.pause();
+    }
+  }
 
   /// A StreamController that listens to the _secureSocksSocket and broadcasts.
-  StreamController<List<int>> _secureResponseController =
-      StreamController.broadcast();
+  late StreamController<List<int>> _secureResponseController =
+      _newResponseController();
 
   /// Getter for the StreamController that listens to the _socksSocket and
   /// broadcasts, or the _secureSocksSocket and broadcasts if SSL is enabled.
@@ -160,6 +218,8 @@ class SOCKSSocket {
   /// Current connection state.
   ConnectionState _state = ConnectionState.disconnected;
 
+  /// Peer close or failure is noticed only while [inputStream] has a listener;
+  /// until then a [write] to a dead peer may appear to succeed.
   ConnectionState get state => _state;
 
   /// Target domain for [reconnect].
@@ -182,14 +242,20 @@ class SOCKSSocket {
   /// Accept bad certificates (testing only).
   final bool _allowBadCertificates;
 
+  final SecurityContext? _securityContext;
+
   /// Cancel signal for in-flight operations.
   Completer<Never>? _cancelCompleter;
-
-  /// Whether SSL upgrade is in progress.
-  bool _sslUpgrading = false;
+  bool _cancelled = false;
+  bool _greetingStarted = false;
+  bool _greetingComplete = false;
+  bool _requestStarted = false;
+  bool _reconnecting = false;
 
   /// Tor circuit isolation token (RFC 1929 username/password auth).
   String? _isolationToken;
+
+  final bool? _requireIsolation;
 
   /// Private constructor.
   SOCKSSocket._(
@@ -199,9 +265,13 @@ class SOCKSSocket {
       this._isolationToken,
       this._handshakeTimeout,
       this._operationTimeout,
-      this._allowBadCertificates);
+      this._allowBadCertificates,
+      this._securityContext,
+      this._requireIsolation);
 
   /// Provides a stream of data as List<int>.
+  ///
+  /// Reads pause while there is no listener; earlier data is kept.
   Stream<List<int>> get inputStream => sslEnabled
       ? _secureResponseController.stream
       : _responseController.stream;
@@ -228,13 +298,14 @@ class SOCKSSocket {
     Duration handshakeTimeout = const Duration(seconds: 30),
     Duration operationTimeout = const Duration(seconds: 30),
     bool allowBadCertificates = false,
+    SecurityContext? securityContext,
+    bool? requireIsolation,
   }) async {
-    // RFC 1929 ULEN/PLEN max 255 bytes.
-    if (isolationToken != null && utf8.encode(isolationToken).length > 255) {
-      throw ArgumentError.value(
-        isolationToken,
-        'isolationToken',
-        'Token UTF-8 encoding exceeds 255 bytes (RFC 1929 limit).',
+    _checkIsolationToken(isolationToken);
+    if (requireIsolation == true && isolationToken == null) {
+      throw ArgumentError(
+        'requireIsolation needs an isolationToken.',
+        'requireIsolation',
       );
     }
 
@@ -246,7 +317,9 @@ class SOCKSSocket {
         isolationToken,
         handshakeTimeout,
         operationTimeout,
-        allowBadCertificates);
+        allowBadCertificates,
+        securityContext,
+        requireIsolation);
 
     // Initialize the SOCKS socket.
     await instance._init();
@@ -264,7 +337,9 @@ class SOCKSSocket {
   })  : _isolationToken = null,
         _handshakeTimeout = const Duration(seconds: 30),
         _operationTimeout = const Duration(seconds: 30),
-        _allowBadCertificates = false {
+        _allowBadCertificates = false,
+        _securityContext = null,
+        _requireIsolation = null {
     _init();
   }
 
@@ -276,61 +351,137 @@ class SOCKSSocket {
   ///   A Future that resolves to void.
   Future<void> _init() async {
     // Connect to the SOCKS proxy server.
-    _socksSocket = await Socket.connect(
-      proxyHost,
-      proxyPort,
-      timeout: _handshakeTimeout,
-    );
+    _applicationInputPaused = false;
+    _cancelled = false;
+    _greetingStarted = false;
+    _greetingComplete = false;
+    _requestStarted = false;
+    if (sslEnabled) {
+      final raw = await RawSocket.connect(
+        proxyHost,
+        proxyPort,
+        timeout: _handshakeTimeout,
+      );
+      _channel = RawChannel(raw);
+      _socksSocket = _channel!.socket();
+    } else {
+      // Keep a native Socket so callers can use SecureSocket.secure(socket).
+      _socksSocket = await Socket.connect(
+        proxyHost,
+        proxyPort,
+        timeout: _handshakeTimeout,
+      );
+      _nativeSocketOpen = true;
+      _socksSocket.done.then<void>((_) {
+        _nativeSocketOpen = false;
+      }, onError: (Object _) {
+        _nativeSocketOpen = false;
+      });
+    }
+    _secureChannel = null;
+    final responses = _responseController;
+    final handshake = _handshakeResponses = StreamController.broadcast();
 
     // Listen to the socket.
     _subscription = _socksSocket.listen(
       (data) {
-        // Add the data to the response controller.
-        _responseController.add(data);
+        (_handshaking ? handshake : _responseController).add(data);
       },
       onError: (e) {
-        _responseController.addError(
-          e is SocksException
-              ? e
-              : SocksConnectionException(
-                  message: 'SOCKS5 connection error: $e',
-                ),
-        );
+        final error = e is SocksException
+            ? e
+            : SocksConnectionException(
+                message: 'SOCKS5 connection error: $e',
+              );
+        if (_handshaking && !handshake.isClosed) handshake.addError(error);
+        if (!responses.isClosed) responses.addError(error);
+        if (_state == ConnectionState.connected) {
+          _state = ConnectionState.error;
+          _abandonConnection();
+        }
       },
       onDone: () {
         // Close the response controller when the socket is closed.
-        // _responseController.close();
+        if (!handshake.isClosed) handshake.close();
+        if (!_sslUpgraded) {
+          if (_state == ConnectionState.connected) {
+            _state = ConnectionState.disconnected;
+            _destroyTransport();
+          }
+          if (!responses.isClosed) responses.close();
+        }
       },
     );
   }
 
+  void _destroyTransport() {
+    // After the TLS upgrade the secure channel owns and drains the raw socket.
+    (_secureChannel ?? _channel)?.destroy();
+    if (_nativeSocketOpen) {
+      _nativeSocketOpen = false;
+      _socksSocket.destroy();
+    }
+  }
+
+  /// Closes controllers directly; a paused input subscription never sees done.
+  void _abandonConnection() {
+    _destroyTransport();
+    if (!_responseController.isClosed) _responseController.close();
+    if (!_secureResponseController.isClosed) {
+      _secureResponseController.close();
+    }
+  }
+
   /// Accumulates [expectedLength] bytes from the response stream.
-  Future<List<int>> _waitForResponse(int expectedLength) {
+  Future<List<int>> _waitForResponse(int expectedLength) =>
+      _waitForReply((_) => expectedLength, allowTrailing: false);
+
+  /// Accumulates a variable-length SOCKS5 connect response.
+  Future<List<int>> _waitForConnectResponse() =>
+      _waitForReply(socksConnectReplyLength, allowTrailing: true);
+
+  Future<List<int>> _waitForReply(
+    int? Function(List<int> buffer) lengthOf, {
+    required bool allowTrailing,
+  }) {
     final completer = Completer<List<int>>();
     final buffer = <int>[];
     late final StreamSubscription<List<int>> sub;
 
-    sub = _responseController.stream.listen(
+    void fail(String reason) {
+      sub.cancel();
+      if (!completer.isCompleted) {
+        completer.completeError(
+          SocksHandshakeException(
+            proxyHost: proxyHost,
+            proxyPort: proxyPort,
+            message: 'SOCKS5 $reason (proxy: $proxyHost:$proxyPort).',
+          ),
+        );
+      }
+    }
+
+    sub = _handshakeResponses!.stream.listen(
       (data) {
         buffer.addAll(data);
-        if (buffer.length >= _maxHandshakeBuffer) {
-          sub.cancel();
-          if (!completer.isCompleted) {
-            completer.completeError(
-              SocksHandshakeException(
-                proxyHost: proxyHost,
-                proxyPort: proxyPort,
-                message: 'SOCKS5 handshake buffer overflow '
-                    '(proxy: $proxyHost:$proxyPort, '
-                    '${buffer.length} bytes received).',
-              ),
-            );
-          }
+        final expectedLength = lengthOf(buffer);
+        if (buffer.length >= _maxHandshakeBuffer &&
+            (expectedLength == null || buffer.length < expectedLength)) {
+          fail('handshake buffer overflow');
           return;
         }
-        if (buffer.length >= expectedLength) {
+        if (expectedLength == null || buffer.length < expectedLength) return;
+        if (expectedLength < 0) {
+          fail('reply is malformed');
+        } else if (!allowTrailing && buffer.length > expectedLength) {
+          fail('reply has unexpected trailing data');
+        } else {
           sub.cancel();
           if (!completer.isCompleted) {
+            if (allowTrailing && expectedLength > 0 && !sslEnabled) {
+              _pendingApplicationData = buffer.sublist(expectedLength);
+              _pauseInput();
+            }
             completer.complete(buffer.sublist(0, expectedLength));
           }
         }
@@ -369,145 +520,55 @@ class SOCKSSocket {
     return dataFuture;
   }
 
-  /// Accumulates a variable-length SOCKS5 connect response.
-  Future<List<int>> _waitForConnectResponse() {
-    final completer = Completer<List<int>>();
-    final buffer = <int>[];
-    late final StreamSubscription<List<int>> sub;
-
-    sub = _responseController.stream.listen(
-      (data) {
-        buffer.addAll(data);
-        if (buffer.length >= _maxHandshakeBuffer) {
-          sub.cancel();
-          if (!completer.isCompleted) {
-            completer.completeError(
-              SocksHandshakeException(
-                proxyHost: proxyHost,
-                proxyPort: proxyPort,
-                message: 'SOCKS5 handshake buffer overflow '
-                    '(proxy: $proxyHost:$proxyPort, '
-                    '${buffer.length} bytes received).',
-              ),
-            );
-          }
-          return;
-        }
-        if (buffer.length >= 5) {
-          final expectedLength = _calcConnectResponseLength(buffer);
-          if (expectedLength != null && buffer.length >= expectedLength) {
-            sub.cancel();
-            if (!completer.isCompleted) {
-              completer.complete(buffer.sublist(0, expectedLength));
-            }
-          }
-        }
-      },
-      onError: (e) {
-        sub.cancel();
-        if (!completer.isCompleted) {
-          completer.completeError(e);
-        }
-      },
-      onDone: () {
-        if (!completer.isCompleted) {
-          completer.completeError(
-            SocksConnectionException(
-              message: 'Connection closed before SOCKS5 response received '
-                  '(proxy: $proxyHost:$proxyPort).',
-            ),
-          );
-        }
-      },
-    );
-
-    final dataFuture = completer.future.timeout(
-      _handshakeTimeout,
-      onTimeout: () {
-        sub.cancel();
-        throw TimeoutException('SOCKS5 handshake timed out after '
-            '${_handshakeTimeout.inSeconds} seconds.');
-      },
-    );
-
-    final cancel = _cancelCompleter;
-    if (cancel != null) {
-      return Future.any<List<int>>([dataFuture, cancel.future]);
-    }
-    return dataFuture;
+  static void _checkIsolationToken(String? token) {
+    if (token != null) encodeSocksCredentials(token, token);
   }
 
-  /// Expected response length by ATYP, or null if undetermined.
-  static int? _calcConnectResponseLength(List<int> buf) {
-    if (buf.length < 4) return null;
-    switch (buf[3]) {
-      case 0x01:
-        return 10; // IPv4: 4 header + 4 addr + 2 port
-      case 0x03:
-        return buf.length >= 5
-            ? 4 + 1 + buf[4] + 2 // Domain: 4 header + 1 len + domain + 2 port
-            : null;
-      case 0x04:
-        return 22; // IPv6: 4 header + 16 addr + 2 port
-      default:
-        return null;
-    }
-  }
+  Future<void> _writeHandshake(List<int> bytes) async =>
+      _socksSocket.add(bytes);
 
   /// Connects to the SOCKS socket.
   ///
   /// Returns:
   ///  A Future that resolves to void.
   Future<void> connect() async {
-    _cancelCompleter = Completer<Never>();
+    _checkNotReconnecting();
+    return _connect();
+  }
+
+  Future<void> _connect() async {
+    if (_greetingStarted || _state != ConnectionState.disconnected) {
+      throw StateError(
+          'Cannot connect: use reconnect() for another connection');
+    }
+    _greetingStarted = true;
+    _cancelCompleter = Completer<Never>()..future.ignore();
     _state = ConnectionState.connecting;
     try {
-      // Greeting and method selection.
-      if (_isolationToken != null) {
-        // Offer both no-auth (0x00) and username/password (0x02).
-        _socksSocket.add([0x05, 0x02, 0x00, 0x02]);
-      } else {
-        // Original no-auth only greeting (backward compatible).
-        _socksSocket.add([0x05, 0x01, 0x00]);
+      await negotiateSocks(
+        write: _writeHandshake,
+        read: _waitForResponse,
+        credentials: _isolationToken == null
+            ? null
+            : encodeSocksCredentials(_isolationToken!, _isolationToken!),
+        allowNoAuthFallback: !(_requireIsolation ?? _isolationToken != null),
+      );
+      if (_cancelled) {
+        throw SocksCancelledException(message: 'SOCKS5 connection cancelled.');
       }
-
-      // Wait for server response (2 bytes per RFC 1928).
-      var response = await _waitForResponse(2);
-
-      if (_isolationToken != null && response[1] == 0x02) {
-        // Sub-negotiate per RFC 1929.
-        final tokenBytes = utf8.encode(_isolationToken!);
-        _socksSocket.add([
-          0x01, // Sub-negotiation version.
-          tokenBytes.length, // ULEN.
-          ...tokenBytes, // UNAME (token as username).
-          tokenBytes.length, // PLEN.
-          ...tokenBytes, // PASSWD (token as password).
-        ]);
-
-        var authResponse = await _waitForResponse(2);
-        if (authResponse[1] != 0x00) {
-          throw SocksHandshakeException(
-            proxyHost: proxyHost,
-            proxyPort: proxyPort,
-            message: 'SOCKS5 authentication failed: '
-                'username/password auth rejected',
-          );
-        }
-      } else if (response[1] != 0x00) {
-        // Server rejected all methods or selected unknown method.
-        throw SocksHandshakeException(
+      _greetingComplete = true;
+    } on SocksProtocolFailure catch (error) {
+      _state = ConnectionState.error;
+      _abandonConnection();
+      _cancelCompleter = null;
+      throw SocksHandshakeException(
           proxyHost: proxyHost,
           proxyPort: proxyPort,
-          message: 'SOCKS5 handshake failed '
-              '(proxy: $proxyHost:$proxyPort): '
-              'proxy rejected authentication method '
-              '(response: 0x${response[1].toRadixString(16).padLeft(2, '0')})',
-        );
-      }
+          message: 'SOCKS5 handshake failed: ${error.message}');
     } catch (e) {
       if (e is! SocksCancelledException) {
         _state = ConnectionState.error;
+        _abandonConnection();
       }
       _cancelCompleter = null;
       rethrow;
@@ -523,90 +584,123 @@ class SOCKSSocket {
   /// Returns:
   ///   A Future that resolves to void.
   Future<void> connectTo(String domain, int port) async {
-    if (_state != ConnectionState.connecting) {
+    _checkNotReconnecting();
+    return _connectTo(domain, port);
+  }
+
+  void _checkNotReconnecting() {
+    if (_reconnecting) throw StateError('Reconnect is already in progress');
+  }
+
+  Future<void> _connectTo(String domain, int port) async {
+    if (_cancelled) {
+      throw SocksCancelledException(message: 'SOCKS5 connection cancelled.');
+    }
+    if (_state != ConnectionState.connecting ||
+        !_greetingComplete ||
+        _requestStarted) {
       throw StateError(
-          'Cannot connectTo: must call connect() first (state: $_state)');
+          'Cannot connectTo: must call connect() and await it before one connectTo()');
     }
 
+    final request = encodeSocksDestination(domain, port);
+
+    _requestStarted = true;
     _targetDomain = domain;
     _targetPort = port;
 
     try {
-      // Connect command.
-      var request = [
-        0x05, // SOCKS version.
-        0x01, // Connect command.
-        0x00, // Reserved.
-        0x03, // Domain name.
-        domain.length,
-        ...domain.codeUnits,
-        (port >> 8) & 0xFF,
-        port & 0xFF
-      ];
-
-      // Send the connect command to the SOCKS proxy server.
       _socksSocket.add(request);
-
-      // Wait for server response (variable length per RFC 1928).
-      var response = await _waitForConnectResponse();
-
-      // Check if the connection was successful.
-      if (response[1] != 0x00) {
-        final replyCode = SocksReplyCode.fromByte(response[1]);
-        throw SocksRequestException(
-          replyCode: replyCode,
-          proxyHost: proxyHost,
-          proxyPort: proxyPort,
-          targetDomain: domain,
-          targetPort: port,
-          message: 'SOCKS5 request failed '
-              '(proxy: $proxyHost:$proxyPort, '
-              'target: $domain:$port, '
-              'reply: ${replyCode?.description ?? "unknown (0x${response[1].toRadixString(16).padLeft(2, '0')})"})',
-        );
+      final response = await _waitForConnectResponse();
+      try {
+        checkSocksConnectReply(response);
+      } on SocksProtocolFailure catch (error) {
+        if (error.replyCode != null) {
+          final replyCode = SocksReplyCode.fromByte(error.replyCode!);
+          throw SocksRequestException(
+            replyCode: replyCode,
+            proxyHost: proxyHost,
+            proxyPort: proxyPort,
+            targetDomain: domain,
+            targetPort: port,
+            message: 'SOCKS5 request failed (proxy: $proxyHost:$proxyPort, '
+                'target: $domain:$port, reply: '
+                '${replyCode?.description ?? "unknown (0x${error.replyCode!.toRadixString(16).padLeft(2, '0')})"})',
+          );
+        }
+        throw SocksHandshakeException(
+            proxyHost: proxyHost, proxyPort: proxyPort, message: error.message);
       }
 
       // Upgrade to SSL if needed.
       if (sslEnabled) {
-        _sslUpgrading = true;
+        final channel = _channel!;
+        final deadline = Completer<RawSecureSocket>()..future.ignore();
+        final timer = Timer(_handshakeTimeout, () {
+          channel.destroy();
+          deadline.completeError(
+              TimeoutException('SOCKS5 SSL handshake timed out after '
+                  '${_handshakeTimeout.inSeconds} seconds.'));
+        });
+        final handshake = RawSecureSocket.secure(
+          channel.raw,
+          subscription: channel.detach(),
+          host: domain,
+          context: _securityContext,
+          onBadCertificate: _allowBadCertificates ? (_) => true : null,
+        );
         try {
           // Upgrade to SSL.
-          _secureSocksSocket = await SecureSocket.secure(
-            _socksSocket,
-            host: domain,
-            onBadCertificate: _allowBadCertificates ? (_) => true : null,
-          );
-          _sslUpgrading = false;
+          final secured = await Future.any<RawSecureSocket>([
+            handshake,
+            deadline.future,
+            if (_cancelCompleter != null) _cancelCompleter!.future,
+          ]);
+          final secureChannel = _secureChannel = RawChannel(secured);
+          _secureSocksSocket = secureChannel.socket();
           _sslUpgraded = true;
+          final responses = _secureResponseController;
 
           // Listen to the secure socket.
           _subscription = _secureSocksSocket.listen(
             (data) {
               // Add the data to the response controller.
-              _secureResponseController.add(data);
+              responses.add(data);
             },
             onError: (e) {
-              _secureResponseController.addError(
-                e is SocksException
-                    ? e
-                    : SocksConnectionException(
-                        message: 'SOCKS5 connection error: $e',
-                      ),
-              );
+              if (!responses.isClosed) {
+                responses.addError(
+                  e is SocksException
+                      ? e
+                      : SocksConnectionException(
+                          message: 'SOCKS5 connection error: $e',
+                        ),
+                );
+              }
+              if (_state == ConnectionState.connected) {
+                _state = ConnectionState.error;
+                _abandonConnection();
+              }
             },
             onDone: () {
-              // Close the response controller when the socket is closed.
-              _secureResponseController.close();
+              if (_state == ConnectionState.connected) {
+                _state = ConnectionState.disconnected;
+                _destroyTransport();
+              }
+              if (!responses.isClosed) responses.close();
             },
           );
+          _pauseInput();
         } catch (e) {
-          _sslUpgrading = false;
+          handshake.then<void>((s) => s.close(), onError: (_) {});
           if (_cancelCompleter?.isCompleted == true) {
             throw SocksCancelledException(
               message: 'SOCKS5 connection cancelled during SSL upgrade.',
             );
           }
           rethrow;
+        } finally {
+          timer.cancel();
         }
       }
 
@@ -619,9 +713,11 @@ class SOCKSSocket {
 
       _state = ConnectionState.connected;
       _cancelCompleter = null;
+      _resumeApplicationInput();
     } catch (e) {
       if (e is! SocksCancelledException) {
         _state = ConnectionState.error;
+        _abandonConnection();
       }
       _cancelCompleter = null;
       rethrow;
@@ -652,33 +748,40 @@ class SOCKSSocket {
     }
   }
 
+  /// Whether SSL upgrade consumed the raw socket.
+  bool _sslUpgraded = false;
+
   /// Closes the connection to the Tor proxy.
   ///
   /// Returns:
   ///  A Future that resolves to void.
-  /// Whether SSL upgrade consumed the raw socket.
-  bool _sslUpgraded = false;
-
   Future<void> close() async {
     _state = ConnectionState.disconnected;
+    final upgraded = sslEnabled && _sslUpgraded;
+    final channel = upgraded ? _secureChannel : _channel;
+    final open = _nativeSocketOpen || (channel != null && !channel.isClosed);
+    var flushed = false;
     // Ensure all data is sent before closing.
     try {
-      if (sslEnabled && _sslUpgraded) {
-        await _secureSocksSocket.flush();
-      } else {
-        await _socksSocket.flush();
+      if (open) {
+        await (upgraded ? _secureSocksSocket : _socksSocket)
+            .flush()
+            .timeout(_operationTimeout);
+        flushed = true;
       }
     } finally {
-      await _subscription?.cancel();
+      _generation++;
       _outputController?.close();
-      if (sslEnabled && _sslUpgraded) {
-        await _secureSocksSocket.close();
-        if (!_secureResponseController.isClosed) {
-          _secureResponseController.close();
-        }
+      if (flushed) {
+        await (upgraded ? _secureSocksSocket : _socksSocket)
+            .close()
+            .then<void>((_) {}, onError: (_) {});
       }
-      if (!_sslUpgraded) {
-        await _socksSocket.close();
+      await _subscription?.cancel();
+      _destroyTransport();
+      _closeHandshakeResponses();
+      if (!_secureResponseController.isClosed) {
+        _secureResponseController.close();
       }
       if (!_responseController.isClosed) {
         _responseController.close();
@@ -688,12 +791,15 @@ class SOCKSSocket {
   }
 
   /// Cancels an in-flight connect operation. No-op if not connecting.
+  /// The instance cannot be reused afterwards; create a new socket.
   Future<void> cancel() async {
     if (_state != ConnectionState.connecting) return;
 
     final c = _cancelCompleter;
     if (c == null || c.isCompleted) return;
 
+    _cancelled = true;
+    _state = ConnectionState.disconnected;
     c.completeError(
       SocksCancelledException(
         message: 'SOCKS5 connection cancelled.',
@@ -701,13 +807,11 @@ class SOCKSSocket {
     );
 
     // Destroy socket to force pending operations to fail.
-    if (_sslUpgrading) {
-      _sslUpgrading = false;
-    }
-    _socksSocket.destroy();
+    _destroyTransport();
 
     await _subscription?.cancel();
     _outputController?.close();
+    _closeHandshakeResponses();
     if (!_responseController.isClosed) _responseController.close();
     if (!_secureResponseController.isClosed) {
       _secureResponseController.close();
@@ -716,15 +820,31 @@ class SOCKSSocket {
     _state = ConnectionState.disconnected;
   }
 
+  void _closeHandshakeResponses() {
+    final handshake = _handshakeResponses;
+    if (handshake != null && !handshake.isClosed) handshake.close();
+  }
+
   /// Reconnects to the previously connected target.
   ///
   /// Throws [StateError] if [connectTo] was never called.
   Future<void> reconnect({String? isolationToken}) async {
+    if (_reconnecting) throw StateError('Reconnect is already in progress');
+    _reconnecting = true;
+    try {
+      await _reconnect(isolationToken);
+    } finally {
+      _reconnecting = false;
+    }
+  }
+
+  Future<void> _reconnect(String? isolationToken) async {
     if (_targetDomain == null || _targetPort == null) {
       throw StateError('Cannot reconnect: no target known. '
           'Call connectTo() before reconnect().');
     }
 
+    _checkIsolationToken(isolationToken);
     if (isolationToken != null) {
       _isolationToken = isolationToken;
     }
@@ -736,14 +856,22 @@ class SOCKSSocket {
     }
 
     // Broadcast controllers can't be reused after close.
-    _responseController = StreamController.broadcast();
-    _secureResponseController = StreamController.broadcast();
+    _pendingApplicationData = null;
+    _responseController = _newResponseController();
+    _secureResponseController = _newResponseController();
     _outputController = null;
 
-    // Re-establish connection sequence.
-    await _init();
-    await connect();
-    await connectTo(_targetDomain!, _targetPort!);
+    try {
+      await _init();
+      await _connect();
+      await _connectTo(_targetDomain!, _targetPort!);
+    } catch (error) {
+      _state = error is SocksCancelledException
+          ? ConnectionState.disconnected
+          : ConnectionState.error;
+      _abandonConnection();
+      rethrow;
+    }
   }
 
   StreamSubscription<List<int>> listen(
