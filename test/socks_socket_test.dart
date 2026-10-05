@@ -1021,6 +1021,34 @@ void main() {
       expect(socket.state, ConnectionState.disconnected);
     });
 
+    for (final phase in ['connect', 'connectTo']) {
+      test('close during $phase throws SocksCancelledException', () async {
+        if (phase == 'connect') {
+          server.hangOnGreeting = true;
+        } else {
+          server.hangOnConnect = true;
+        }
+        await server.start();
+
+        final socket = await SOCKSSocket.create(
+          proxyHost: InternetAddress.loopbackIPv4.address,
+          proxyPort: server.port,
+          handshakeTimeout: const Duration(seconds: 5),
+        );
+        if (phase == 'connectTo') await socket.connect();
+        final pending = phase == 'connect'
+            ? socket.connect()
+            : socket.connectTo('example.com', 80);
+        final failed =
+            expectLater(pending, throwsA(isA<SocksCancelledException>()));
+
+        await Future.delayed(const Duration(milliseconds: 50));
+        await socket.close();
+        await failed;
+        expect(socket.state, ConnectionState.disconnected);
+      });
+    }
+
     test('cancel during connectTo throws SocksCancelledException', () async {
       server.hangOnConnect = true;
       await server.start();

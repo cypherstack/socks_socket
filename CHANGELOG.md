@@ -5,7 +5,7 @@
 - Keep handshake replies out of `inputStream`; buffer input until a listener attaches.
 - Bound SSL handshakes; add `securityContext` and `requireIsolation` (defaults to true with a token: a no-auth proxy is now rejected).
 - Serialize `write` and `outputStream`; report transport failures as `SocksConnectionException`.
-- Reject overlapping connect calls; track peer close in `state`.
+- Reject overlapping connect calls; track peer close in `state`; `close()` or `cancel()` during connect spends the instance.
 - Rename `ConnectionState` to `SocksSocketState` (alias kept); add `socks.dart` for Flutter.
 
 ## 1.3.0

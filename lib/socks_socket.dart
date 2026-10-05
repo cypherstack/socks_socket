@@ -572,22 +572,26 @@ class SOCKSSocket {
       }
       _greetingComplete = true;
     } on SocksProtocolFailure catch (error) {
+      _cancelCompleter = null;
+      if (_closing) throw _closedBeforeConnected();
       _state = SocksSocketState.error;
       _abandonConnection();
-      _cancelCompleter = null;
       throw SocksHandshakeException(
           proxyHost: proxyHost,
           proxyPort: proxyPort,
           message: 'SOCKS5 handshake failed: ${error.message}');
     } catch (e) {
-      if (e is! SocksCancelledException) {
-        _state = SocksSocketState.error;
-        _abandonConnection();
-      }
       _cancelCompleter = null;
+      if (e is SocksCancelledException) rethrow;
+      if (_closing) throw _closedBeforeConnected();
+      _state = SocksSocketState.error;
+      _abandonConnection();
       rethrow;
     }
   }
+
+  SocksCancelledException _closedBeforeConnected() => SocksCancelledException(
+      message: 'SOCKS5 connection closed before it was established.');
 
   /// Connects to the specified [domain] and [port] through the SOCKS socket.
   ///
@@ -723,11 +727,11 @@ class SOCKSSocket {
       _cancelCompleter = null;
       _resumeApplicationInput();
     } catch (e) {
-      if (e is! SocksCancelledException) {
-        _state = SocksSocketState.error;
-        _abandonConnection();
-      }
       _cancelCompleter = null;
+      if (e is SocksCancelledException) rethrow;
+      if (_closing) throw _closedBeforeConnected();
+      _state = SocksSocketState.error;
+      _abandonConnection();
       rethrow;
     }
   }
