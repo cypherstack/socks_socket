@@ -787,6 +787,32 @@ class SOCKSSocket {
   ///  A Future that resolves to void.
   Future<void> close() => _closeFuture ??= _close();
 
+  Future<void> _flushBeforeClose(Socket transport) async {
+    final elapsed = Stopwatch()..start();
+    while (true) {
+      final remaining = _operationTimeout - elapsed.elapsed;
+      if (remaining <= Duration.zero) {
+        throw TimeoutException(
+            'SOCKS5 output did not drain before close', _operationTimeout);
+      }
+      final Future flushing;
+      try {
+        flushing = transport.flush();
+      } on StateError {
+        // The public native socket may have an active flush/addStream outside
+        // _writeTail. IOSink rejects another flush synchronously while bound,
+        // and exposes no future for that operation. Keep its transport alive
+        // and retry within one deadline; wrapping it would break manual TLS.
+        const interval = Duration(milliseconds: 10);
+        await Future<void>.delayed(remaining < interval ? remaining : interval);
+        continue;
+      }
+      // Async failures belong to the flush itself and must not be retried.
+      await flushing.timeout(remaining);
+      return;
+    }
+  }
+
   Future<void> _close() async {
     _closing = true;
     final upgraded = sslEnabled && _sslUpgraded;
@@ -798,9 +824,7 @@ class SOCKSSocket {
       await _writeTail;
       final open = _nativeSocketOpen || (channel != null && !channel.isClosed);
       if (open && _writeFailure == null) {
-        await (upgraded ? _secureSocksSocket : _socksSocket)
-            .flush()
-            .timeout(_operationTimeout);
+        await _flushBeforeClose(upgraded ? _secureSocksSocket : _socksSocket);
         flushed = true;
       }
     } catch (error, stack) {

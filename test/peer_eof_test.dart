@@ -1,0 +1,143 @@
+import 'dart:async';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:socks_socket/socks_socket.dart';
+import 'package:socks_socket/src/connection_socket.dart';
+import 'package:test/test.dart';
+
+import 'helpers/test_certificates.dart';
+
+const _deadline = Duration(seconds: 5);
+
+class _Peer {
+  final Socket socket;
+  final bytes = BytesBuilder(copy: false);
+  final firstChunk = Completer<void>();
+  final done = Completer<void>();
+  late final StreamSubscription<List<int>> input;
+
+  _Peer(this.socket) {
+    input = socket.listen((chunk) {
+      bytes.add(chunk);
+      if (!firstChunk.isCompleted) firstChunk.complete();
+    }, onError: (Object error, StackTrace stack) {
+      done.completeError(error, stack);
+    }, onDone: () {
+      if (!done.isCompleted) done.complete();
+    });
+    done.future.ignore();
+  }
+}
+
+Future<(SOCKSSocket, _Peer)> _connect({
+  bool tls = false,
+  Duration operationTimeout = _deadline,
+}) async {
+  final certificates = tls ? TestCertificates.generate() : null;
+  final server = await RawServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+  addTearDown(server.close);
+  final accepted = Completer<_Peer>();
+  server.listen((raw) async {
+    addTearDown(raw.close);
+    try {
+      final channel = RawChannel(raw);
+      final greeting = await channel.read(2);
+      await channel.read(greeting[1]);
+      await channel.write([5, 0]);
+      final request = await channel.read(5);
+      await channel.read(request[4] + 2);
+      await channel.write([5, 0, 0, 1, 127, 0, 0, 1, 0, 0]);
+      final Socket transport;
+      if (tls) {
+        final secured = await RawSecureSocket.secureServer(
+          raw,
+          certificates!.serverContext(),
+          subscription: channel.detach(),
+        );
+        transport = RawChannel(secured).socket();
+      } else {
+        transport = channel.socket();
+      }
+      addTearDown(transport.destroy);
+      accepted.complete(_Peer(transport));
+    } catch (error, stack) {
+      accepted.completeError(error, stack);
+    }
+  });
+  final client = await SOCKSSocket.create(
+    proxyHost: InternetAddress.loopbackIPv4.address,
+    proxyPort: server.port,
+    sslEnabled: tls,
+    securityContext: certificates?.clientContext(),
+    operationTimeout: operationTimeout,
+  );
+  addTearDown(() => client.close().catchError((_) {}));
+  await client.connect();
+  await client.connectTo('localhost', 443);
+  return (client, await accepted.future.timeout(_deadline));
+}
+
+void main() {
+  test('peer EOF drains a pending underlying socket flush', () async {
+    final (client, peer) = await _connect();
+    final eof = client.inputStream.drain<void>();
+    // Linux SO_SNDBUF: force the upload to remain pending while reads pause.
+    client.socket.setRawOption(RawSocketOption.fromInt(1, 7, 4096));
+    peer.input.pause();
+    final payload = List<int>.generate(512 * 1024, (i) => i % 251);
+    client.socket.add(payload);
+    var flushed = false;
+    final flushing = client.socket.flush().then((_) => flushed = true);
+    flushing.ignore();
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(flushed, isFalse, reason: 'The regression needs a pending flush');
+    await peer.socket.close();
+    await eof.timeout(_deadline);
+    peer.input.resume();
+    await flushing.timeout(_deadline);
+    await client.close().timeout(_deadline);
+    await peer.done.future.timeout(_deadline);
+    expect(peer.bytes.takeBytes(), payload);
+  }, testOn: 'linux');
+
+  for (final tls in [false, true]) {
+    test('peer EOF drains underlying socket.addStream (TLS=$tls)', () async {
+      final (client, peer) = await _connect(tls: tls);
+      final eof = client.inputStream.drain<void>();
+      final source = StreamController<List<int>>();
+      addTearDown(source.close);
+      final uploading = client.socket.addStream(source.stream);
+      uploading.ignore();
+      source.add([65]);
+      await peer.firstChunk.future.timeout(_deadline);
+      await peer.socket.close();
+      await eof.timeout(_deadline);
+      source.add([66]);
+      await source.close();
+      await uploading.timeout(_deadline);
+      await client.close().timeout(_deadline);
+      await peer.done.future.timeout(_deadline);
+      expect(peer.bytes.takeBytes(), [65, 66]);
+    });
+  }
+
+  test('close times out when an underlying upload never ends', () async {
+    final (client, peer) = await _connect(
+      operationTimeout: const Duration(milliseconds: 100),
+    );
+    final eof = client.inputStream.drain<void>();
+    final source = StreamController<List<int>>();
+    addTearDown(source.close);
+    client.socket.addStream(source.stream).ignore();
+    source.add([65]);
+    await peer.firstChunk.future.timeout(_deadline);
+    await peer.socket.close();
+    await eof.timeout(_deadline);
+    await expectLater(
+        client.close().timeout(_deadline), throwsA(isA<TimeoutException>()));
+    await peer.done.future.timeout(_deadline);
+    expect(client.state, ConnectionState.disconnected);
+    expect(source.hasListener, isFalse);
+  });
+}
