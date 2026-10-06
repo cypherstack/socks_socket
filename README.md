@@ -12,13 +12,20 @@ SOCKS version 5 sockets for Dart and Flutter, *eg.* ElectrumX and/or Fulcrum ove
 - Supports ElectrumX and Fulcrum servers via socket(s).
 - Async support for non-blocking network communication.
 - Lightweight and minimal dependencies.
+- Configurable connection timeouts (handshake and operation).
+- Reconnection support without creating a new instance.
+- Newline option for line-delimited protocols (ElectrumX).
+- Connection state tracking (disconnected, connecting, connected, error).
+- Typed exception hierarchy with SOCKS5 reply codes.
+- Tor circuit isolation via `isolationToken`.
+- Cancellation of in-flight connections via `cancel()`.
 
 ## Getting Started
 
 See `socks_socket.dart` itself for properties and methods and the example for reference.
 
 ```dart
-import 'package:socks_socket/socks_socket.dart';
+import 'package:socks_socket/socks.dart';
 
 // Instantiate a socks socket at localhost and on the port selected by the tor service.
 var socksSocket = await SOCKSSocket.create(
@@ -38,3 +45,54 @@ await socksSocket.connectTo('bitcoin.stackwallet.com', 50002);
 // Send a server features command to the socket, see method for more specific usage example.
 await socksSocket.sendServerFeaturesCommand();
 ```
+
+`socks.dart` omits the `ConnectionState` alias for use alongside Flutter.
+
+## Timeout Configuration
+
+```dart
+// Configure custom timeouts for slow networks like Tor.
+var socksSocket = await SOCKSSocket.create(
+    proxyHost: InternetAddress.loopbackIPv4.address,
+    proxyPort: Tor.instance.port,
+    sslEnabled: true,
+    handshakeTimeout: Duration(seconds: 60),
+    operationTimeout: Duration(seconds: 45),
+);
+```
+
+## Circuit Isolation
+
+```dart
+// Use isolationToken to request a separate Tor circuit.
+var socksSocket = await SOCKSSocket.create(
+    proxyHost: InternetAddress.loopbackIPv4.address,
+    proxyPort: Tor.instance.port,
+    sslEnabled: true,
+    isolationToken: 'wallet-btc-001',
+);
+await socksSocket.connect();
+await socksSocket.connectTo('bitcoin.stackwallet.com', 50002);
+
+// Reconnect with a different token; requires an earlier connectTo().
+await socksSocket.reconnect(isolationToken: 'wallet-btc-002');
+```
+
+Tokens are sent as SOCKS5 credentials. A proxy selecting no-auth is rejected unless `requireIsolation: false`.
+
+## Reconnection
+
+```dart
+// After a connection drops, reconnect to the same target.
+await socksSocket.reconnect();
+
+// Continue sending data on the restored connection.
+await socksSocket.write('{"jsonrpc":"2.0","method":"server.ping","id":1}',
+    newline: true);
+```
+
+`cancel()` or `close()` during connect spends the instance; create a new one. Peer close is noticed, and `state` updated, only while `inputStream` has a listener.
+
+## HttpClient Connections
+
+`SocksConnection.start` returns a cancellable `ConnectionTask<Socket>` for `HttpClient.connectionFactory`; see `example/http/http_connection.dart`. Pass `tlsHost` for HTTPS. Requires Dart 3.5.
