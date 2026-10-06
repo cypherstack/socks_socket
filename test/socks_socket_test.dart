@@ -31,6 +31,19 @@ Future<SOCKSSocket> createAndConnect(
   return socket;
 }
 
+/// Collects [length] bytes through [SOCKSSocket.listen], however they arrive.
+Future<List<int>> collect(SOCKSSocket socket, int length) {
+  final completer = Completer<List<int>>();
+  final received = <int>[];
+  socket.listen((data) {
+    received.addAll(data);
+    if (received.length >= length && !completer.isCompleted) {
+      completer.complete(received);
+    }
+  });
+  return completer.future.timeout(const Duration(seconds: 5));
+}
+
 void main() {
   final certificates = TestCertificates.generate();
 
@@ -114,16 +127,11 @@ void main() {
     test('sends data and receives echo response', () async {
       final socket = await createAndConnect(server);
       try {
-        final completer = Completer<List<int>>();
-        socket.listen((data) {
-          if (!completer.isCompleted) completer.complete(data);
-        });
+        final received = collect(socket, utf8.encode('hello').length);
 
         await socket.write('hello');
 
-        final received =
-            await completer.future.timeout(const Duration(seconds: 5));
-        expect(received, equals(utf8.encode('hello')));
+        expect(await received, equals(utf8.encode('hello')));
       } finally {
         await socket.close();
       }
@@ -132,16 +140,11 @@ void main() {
     test('write with newline appends trailing newline', () async {
       final socket = await createAndConnect(server);
       try {
-        final completer = Completer<List<int>>();
-        socket.listen((data) {
-          if (!completer.isCompleted) completer.complete(data);
-        });
+        final received = collect(socket, utf8.encode('test\n').length);
 
         await socket.write('test', newline: true);
 
-        final received =
-            await completer.future.timeout(const Duration(seconds: 5));
-        expect(received, equals(utf8.encode('test\n')));
+        expect(await received, equals(utf8.encode('test\n')));
       } finally {
         await socket.close();
       }
@@ -320,16 +323,11 @@ void main() {
         trust: certificates.clientContext(),
       );
       try {
-        final completer = Completer<List<int>>();
-        socket.listen((data) {
-          if (!completer.isCompleted) completer.complete(data);
-        });
+        final received = collect(socket, utf8.encode('ssl-hello').length);
 
         await socket.write('ssl-hello');
 
-        final received =
-            await completer.future.timeout(const Duration(seconds: 5));
-        expect(received, equals(utf8.encode('ssl-hello')));
+        expect(await received, equals(utf8.encode('ssl-hello')));
       } finally {
         await socket.close();
       }
@@ -532,16 +530,11 @@ void main() {
       try {
         await socket.reconnect();
 
-        final completer = Completer<List<int>>();
-        socket.listen((data) {
-          if (!completer.isCompleted) completer.complete(data);
-        });
+        final received = collect(socket, utf8.encode('hello').length);
 
         await socket.write('hello');
 
-        final received =
-            await completer.future.timeout(const Duration(seconds: 5));
-        expect(received, equals(utf8.encode('hello')));
+        expect(await received, equals(utf8.encode('hello')));
       } finally {
         await socket.close();
       }
