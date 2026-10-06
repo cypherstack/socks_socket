@@ -244,6 +244,7 @@ class SOCKSSocket {
   StackTrace? _writeFailureStack;
   Future<void>? _closeFuture;
   bool _closing = false;
+  bool _peerReadClosed = false;
 
   /// Accept bad certificates (testing only).
   final bool _allowBadCertificates;
@@ -289,12 +290,16 @@ class SOCKSSocket {
     final sink = _SocketOutputSink(_queueSinkWrite, (error, stack) {
       if (generation == _generation) _failWrites(error, stack);
     });
-    if (_writeFailure != null) sink._stop(_writeFailure!, _writeFailureStack!);
+    if (_writeFailure != null) {
+      sink._stop(_writeFailure!, _writeFailureStack!);
+    } else if (_closing) {
+      sink.close().ignore();
+    }
     return sink;
   }
 
   Future<void> _queueSinkWrite(List<int> data) {
-    if (_state != SocksSocketState.connected) {
+    if (!_canQueueWrite(allowClosing: true)) {
       throw StateError(
           'Cannot write: socket is not connected (state: $_state)');
     }
@@ -368,6 +373,7 @@ class SOCKSSocket {
     _greetingStarted = false;
     _greetingComplete = false;
     _requestStarted = false;
+    _peerReadClosed = false;
     if (sslEnabled) {
       final raw = await RawSocket.connect(
         proxyHost,
@@ -422,6 +428,7 @@ class SOCKSSocket {
 
   /// The peer stopped sending; writes already accepted are still delivered.
   void _peerClosed() {
+    _peerReadClosed = true;
     _state = SocksSocketState.disconnected;
     close().ignore();
   }
@@ -743,8 +750,19 @@ class SOCKSSocket {
     await _queueWrite(newline ? [...data, 0x0A] : data);
   }
 
+  bool _canQueueWrite({bool allowClosing = false}) {
+    if (_closing && !allowClosing) return false;
+    // close() rejects new sink operations, but an already accepted addStream
+    // still feeds chunks after read-side EOF until it finishes or times out.
+    return _state == SocksSocketState.connected ||
+        (allowClosing &&
+            _closing &&
+            _peerReadClosed &&
+            _state == SocksSocketState.disconnected);
+  }
+
   Future<void> _queueWrite(List<int> data, {bool allowClosing = false}) {
-    if ((_closing && !allowClosing) || _state != SocksSocketState.connected) {
+    if (!_canQueueWrite(allowClosing: allowClosing)) {
       return Future<void>.error(
           StateError('Cannot write: socket is not connected (state: $_state)'));
     }

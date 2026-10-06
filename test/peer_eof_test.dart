@@ -120,24 +120,68 @@ void main() {
       await peer.done.future.timeout(_deadline);
       expect(peer.bytes.takeBytes(), [65, 66]);
     });
+
+    test('peer EOF drains an accepted outputStream (TLS=$tls)', () async {
+      final (client, peer) = await _connect(tls: tls);
+      final eof = client.inputStream.drain<void>();
+      final source = StreamController<List<int>>();
+      addTearDown(source.close);
+      final output = client.outputStream;
+      final uploading = output.addStream(source.stream);
+      uploading.ignore();
+      source.add([65]);
+      await peer.firstChunk.future.timeout(_deadline);
+      await peer.socket.close();
+      await eof.timeout(_deadline);
+
+      expect(client.state, ConnectionState.disconnected);
+      await expectLater(client.write('new write'), throwsStateError);
+      expect(() => output.add([67]), throwsStateError);
+      expect(() => output.addStream(Stream.value([68])), throwsStateError);
+      source.add([66]);
+      await source.close();
+      await uploading.timeout(_deadline);
+      await output.done.timeout(_deadline);
+      await client.close().timeout(_deadline);
+      await peer.done.future.timeout(_deadline);
+      expect(peer.bytes.takeBytes(), [65, 66]);
+    });
   }
 
-  test('close times out when an underlying upload never ends', () async {
-    final (client, peer) = await _connect(
-      operationTimeout: const Duration(milliseconds: 100),
-    );
+  test('an output sink first used after peer EOF rejects new uploads',
+      () async {
+    final (client, peer) = await _connect();
     final eof = client.inputStream.drain<void>();
-    final source = StreamController<List<int>>();
-    addTearDown(source.close);
-    client.socket.addStream(source.stream).ignore();
-    source.add([65]);
-    await peer.firstChunk.future.timeout(_deadline);
     await peer.socket.close();
     await eof.timeout(_deadline);
-    await expectLater(
-        client.close().timeout(_deadline), throwsA(isA<TimeoutException>()));
+    expect(() => client.outputStream.add([65]), throwsStateError);
+    expect(() => client.outputStream.addStream(Stream.value([66])),
+        throwsStateError);
+    await client.close().timeout(_deadline);
     await peer.done.future.timeout(_deadline);
-    expect(client.state, ConnectionState.disconnected);
-    expect(source.hasListener, isFalse);
+    expect(peer.bytes.length, 0);
   });
+
+  for (final direct in [false, true]) {
+    test('close times out when an upload never ends (direct=$direct)',
+        () async {
+      final (client, peer) = await _connect(
+        operationTimeout: const Duration(milliseconds: 100),
+      );
+      final eof = client.inputStream.drain<void>();
+      final source = StreamController<List<int>>();
+      addTearDown(source.close);
+      final output = direct ? client.socket : client.outputStream;
+      output.addStream(source.stream).ignore();
+      source.add([65]);
+      await peer.firstChunk.future.timeout(_deadline);
+      await peer.socket.close();
+      await eof.timeout(_deadline);
+      await expectLater(
+          client.close().timeout(_deadline), throwsA(isA<TimeoutException>()));
+      await peer.done.future.timeout(_deadline);
+      expect(client.state, ConnectionState.disconnected);
+      expect(source.hasListener, isFalse);
+    });
+  }
 }
