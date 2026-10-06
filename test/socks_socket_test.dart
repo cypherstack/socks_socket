@@ -244,44 +244,16 @@ void main() {
       server.dropConnection = true;
       await server.start();
 
-      // Broken pipe from Socket.done leaks as a zone error; guard it.
-      final testCompleter = Completer<void>();
-      runZonedGuarded(() async {
-        final socket = await SOCKSSocket.create(
-          proxyHost: InternetAddress.loopbackIPv4.address,
-          proxyPort: server.port,
-          handshakeTimeout: const Duration(milliseconds: 500),
-        );
+      final socket = await SOCKSSocket.create(
+        proxyHost: InternetAddress.loopbackIPv4.address,
+        proxyPort: server.port,
+        handshakeTimeout: const Duration(milliseconds: 500),
+      );
+      addTearDown(() => socket.close().catchError((_) {}));
 
-        final errorSub = socket.inputStream.listen(
-          (_) {},
-          onError: (_) {},
-          onDone: () {},
-        );
-
-        try {
-          await socket.connect();
-          // If we get here, the handshake timeout should fire.
-          fail('Should have thrown');
-        } catch (e) {
-          // Any error is acceptable: TimeoutException, SocketException,
-          // or connection-closed Exception.
-          expect(e, isNotNull);
-        } finally {
-          await errorSub.cancel();
-          try {
-            await socket.close().timeout(const Duration(seconds: 2));
-          } catch (_) {}
-        }
-        testCompleter.complete();
-      }, (error, stack) {
-        // Swallow zone errors (Broken pipe from Socket.done).
-        if (!testCompleter.isCompleted) {
-          testCompleter.complete();
-        }
-      });
-
-      await testCompleter.future.timeout(const Duration(seconds: 5));
+      await expectLater(
+          socket.connect(), throwsA(isA<SocksConnectionException>()));
+      expect(socket.state, ConnectionState.error);
     });
 
     test('configurable handshakeTimeout is respected', () async {
