@@ -138,6 +138,7 @@ class SOCKSSocket {
   late Socket _secureSocksSocket;
 
   bool _nativeSocketOpen = false;
+  bool _nativeSocketNeedsDestroy = false;
 
   RawChannel? _channel;
 
@@ -390,6 +391,7 @@ class SOCKSSocket {
         timeout: _handshakeTimeout,
       );
       _nativeSocketOpen = true;
+      _nativeSocketNeedsDestroy = true;
       _socksSocket.done.then<void>((_) {
         _nativeSocketOpen = false;
       }, onError: (Object _) {
@@ -436,7 +438,10 @@ class SOCKSSocket {
   void _destroyTransport() {
     // After the TLS upgrade the secure channel owns and drains the raw socket.
     (_secureChannel ?? _channel)?.destroy();
-    if (_nativeSocketOpen) {
+    // Sink completion does not cancel a paused addStream source after a reset.
+    // Destroy every native transport we own, even when its done has completed.
+    if (_nativeSocketNeedsDestroy) {
+      _nativeSocketNeedsDestroy = false;
       _nativeSocketOpen = false;
       _socksSocket.destroy();
     }

@@ -10,6 +10,11 @@ import 'helpers/test_certificates.dart';
 
 const _deadline = Duration(seconds: 5);
 
+// SOL_SOCKET, SO_SNDBUF and SO_LINGER differ between Linux and macOS.
+final _solSocket = Platform.isMacOS ? 0xffff : 1;
+final _soSndbuf = Platform.isMacOS ? 0x1001 : 7;
+final _soLinger = Platform.isMacOS ? 0x80 : 13;
+
 class _Peer {
   final Socket socket;
   final bytes = BytesBuilder(copy: false);
@@ -161,6 +166,38 @@ void main() {
     await peer.done.future.timeout(_deadline);
     expect(peer.bytes.length, 0);
   });
+
+  test('reset after peer EOF cancels a paused underlying upload source',
+      () async {
+    final (client, peer) = await _connect();
+    final eof = client.inputStream.drain<void>();
+    final source = StreamController<List<int>>();
+    addTearDown(() async {
+      client.socket.destroy();
+      await source.close();
+    });
+    // Shrink SO_SNDBUF to keep the source paused in an in-flight write.
+    client.socket
+        .setRawOption(RawSocketOption.fromInt(_solSocket, _soSndbuf, 4096));
+    final uploading = client.socket.addStream(source.stream);
+    final failed = expectLater(uploading, throwsA(isA<SocketException>()));
+    source.add([65]);
+    await peer.firstChunk.future.timeout(_deadline);
+    peer.input.pause();
+    source.add(List<int>.filled(512 * 1024, 66));
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(source.isPaused, isTrue);
+    await peer.socket.close();
+    await eof.timeout(_deadline);
+    // SO_LINGER {on=1, seconds=0}: reset the remaining write side.
+    peer.socket.setRawOption(RawSocketOption(_solSocket, _soLinger,
+        Uint8List.view(Int32List.fromList([1, 0]).buffer)));
+    peer.socket.destroy();
+    await failed.timeout(_deadline);
+    await client.close().timeout(_deadline);
+    expect(source.hasListener, isFalse);
+    await source.close().timeout(_deadline);
+  }, testOn: 'linux || mac-os');
 
   for (final direct in [false, true]) {
     test('close times out when an upload never ends (direct=$direct)',
