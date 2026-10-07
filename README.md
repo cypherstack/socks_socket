@@ -97,6 +97,25 @@ By default the connection closes once the peer closes its side. Pass `closeOnPee
 
 `destroy()` aborts a connection without draining output; pending writes fail, and a connect, TLS handshake or `reconnect()` in flight ends with `SocksCancelledException`. Use `close()` to drain accepted output before closing; it ends a connect or `reconnect()` in flight the same way.
 
+## Migrating to 2.0.0
+
+`SOCKSSocket.socket` has been removed. All transport operations now go through the wrapper so writes and teardown share the same lifecycle tracking.
+
+| Previous operation | Replacement |
+| --- | --- |
+| `socks.socket.destroy()` | `socks.destroy()` |
+| `socks.socket.close()` | `await socks.close()` |
+| `socks.socket.add(bytes)` | `socks.outputStream.add(bytes)` |
+| `socks.socket.addStream(source)` | `await socks.outputStream.addStream(source)` |
+| Reading the underlying socket | `socks.inputStream` or `socks.listen(...)` |
+| `SecureSocket.secure(socks.socket, ...)` | Set `sslEnabled: true` and, if needed, `securityContext` on `SOCKSSocket.create(...)` |
+
+For an awaited binary write, use `await socks.outputStream.addStream(Stream.value(bytes))`. The output sink accepts one stream at a time. For text, use `await socks.write(text)`. To drain and finish the connection, use `await socks.close()`.
+
+Built-in TLS starts during `connectTo()`, after the SOCKS handshake. Upgrading an established plaintext application session to TLS is not exposed by `SOCKSSocket`.
+
+`SocksConnection.start` still returns a `ConnectionTask<Socket>` for `HttpClient.connectionFactory`; that separate API is unchanged.
+
 ## HttpClient Connections
 
 `SocksConnection.start` returns a cancellable `ConnectionTask<Socket>` for `HttpClient.connectionFactory`; see `example/http/http_connection.dart`. Pass `tlsHost` for HTTPS. Requires Dart 3.5.

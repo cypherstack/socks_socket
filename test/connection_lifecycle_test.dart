@@ -82,7 +82,7 @@ void main() {
   });
 
   test('peer EOF still delivers accepted writes', () async {
-    const size = 1024 * 1024;
+    const size = 8 * 1024 * 1024;
     final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
     addTearDown(server.close);
     final received = Completer<int>();
@@ -119,8 +119,6 @@ void main() {
     addTearDown(() => uploader.close().catchError((_) {}));
     await uploader.connect();
     await uploader.connectTo('localhost', 80);
-    // Linux SO_SNDBUF.
-    uploader.socket.setRawOption(RawSocketOption.fromInt(1, 7, 65536));
     final input = uploader.inputStream.drain<void>();
     await uploader.write('A' * size);
     await input;

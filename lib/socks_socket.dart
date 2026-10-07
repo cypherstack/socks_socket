@@ -131,12 +131,7 @@ class SOCKSSocket {
   /// The underlying Socket that connects to the SOCKS5 proxy server.
   late Socket _socksSocket;
 
-  /// Getter for the underlying Socket that connects to the SOCKS5 proxy server.
-  ///
-  /// To abort the connection, call [destroy] rather than `socket.destroy()`:
-  /// dart:io completes a pending flush on a destroyed [Socket] normally, so
-  /// writes cut short that way would be reported as sent.
-  Socket get socket => sslEnabled ? _secureSocksSocket : _socksSocket;
+  Socket get _socket => sslEnabled ? _secureSocksSocket : _socksSocket;
 
   /// A wrapper around the _socksSocket that enables SSL connections.
   late Socket _secureSocksSocket;
@@ -402,7 +397,6 @@ class SOCKSSocket {
       _channel = RawChannel(raw);
       _socksSocket = _channel!.socket();
     } else {
-      // Keep a native Socket so callers can use SecureSocket.secure(socket).
       _socksSocket = await _connectProxy(Socket.startConnect);
       _nativeSocketOpen = true;
       _nativeSocketNeedsDestroy = true;
@@ -810,8 +804,8 @@ class SOCKSSocket {
         Error.throwWithStackTrace(_writeFailure!, _writeFailureStack!);
       }
       try {
-        socket.add(bytes);
-        await socket.flush().timeout(_operationTimeout);
+        _socket.add(bytes);
+        await _socket.flush().timeout(_operationTimeout);
         // A transport destroyed mid-flush can still complete the flush.
         if (_writeFailure != null) {
           Error.throwWithStackTrace(_writeFailure!, _writeFailureStack!);
@@ -877,32 +871,6 @@ class SOCKSSocket {
     _closeFuture = (_closeFuture ?? _close()).catchError((Object _) {});
   }
 
-  Future<void> _flushBeforeClose(Socket transport) async {
-    final elapsed = Stopwatch()..start();
-    while (true) {
-      final remaining = _operationTimeout - elapsed.elapsed;
-      if (remaining <= Duration.zero) {
-        throw TimeoutException(
-            'SOCKS5 output did not drain before close', _operationTimeout);
-      }
-      final Future flushing;
-      try {
-        flushing = transport.flush();
-      } on StateError {
-        // The public native socket may have an active flush/addStream outside
-        // _writeTail. IOSink rejects another flush synchronously while bound,
-        // and exposes no future for that operation. Keep its transport alive
-        // and retry within one deadline; wrapping it would break manual TLS.
-        const interval = Duration(milliseconds: 10);
-        await Future<void>.delayed(remaining < interval ? remaining : interval);
-        continue;
-      }
-      // Async failures belong to the flush itself and must not be retried.
-      await flushing.timeout(remaining);
-      return;
-    }
-  }
-
   /// Ends a connect in flight. The TLS handshake cannot notice a destroyed
   /// transport on its own, so it waits for this or for its deadline.
   void _signalCancel(SocksCancelledException error) {
@@ -923,7 +891,9 @@ class SOCKSSocket {
       await _writeTail;
       final open = _nativeSocketOpen || (channel != null && !channel.isClosed);
       if (open && _writeFailure == null) {
-        await _flushBeforeClose(upgraded ? _secureSocksSocket : _socksSocket);
+        await (upgraded ? _secureSocksSocket : _socksSocket)
+            .flush()
+            .timeout(_operationTimeout);
         flushed = true;
       }
     } catch (error, stack) {

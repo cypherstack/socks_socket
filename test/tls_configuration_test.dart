@@ -8,7 +8,7 @@ import 'helpers/mock_socks_server.dart';
 import 'helpers/test_certificates.dart';
 
 void main() {
-  test('legacy plain socket supports a caller-managed TLS upgrade', () async {
+  test('SOCKSSocket manages TLS with a custom security context', () async {
     final certificates = TestCertificates.generate();
     final proxy = MockSocksServer()
       ..sslEnabled = true
@@ -18,16 +18,14 @@ void main() {
     final socket = await SOCKSSocket.create(
       proxyHost: InternetAddress.loopbackIPv4.address,
       proxyPort: proxy.port,
+      sslEnabled: true,
+      securityContext: certificates.clientContext(),
     );
     addTearDown(socket.close);
     await socket.connect();
     await socket.connectTo('localhost', 443);
-    final secured = await SecureSocket.secure(socket.socket,
-        host: 'localhost', context: certificates.clientContext());
-    addTearDown(secured.destroy);
-    final reply = secured.expand((b) => b).take(10).toList();
-    secured.add(utf8.encode('manual TLS'));
-    await secured.flush();
-    expect(utf8.decode(await reply), 'manual TLS');
+    final reply = socket.inputStream.expand((b) => b).take(10).toList();
+    await socket.write('custom TLS');
+    expect(utf8.decode(await reply), 'custom TLS');
   });
 }
