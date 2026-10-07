@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:socks_socket/src/connection_socket.dart';
 import 'package:test/test.dart';
@@ -53,6 +54,73 @@ class _PendingWriteSocket extends Stream<RawSocketEvent> implements RawSocket {
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
+/// A socket that fails its next read or write synchronously: dart:io delivers
+/// the error through the event stream and closes the socket before the call
+/// returns, so no event follows. A plain socket reports a read failure this
+/// way, which is how macOS surfaces a reset peer, and a secure socket reports
+/// a write after the connection closed this way.
+class _ResetSocket extends Stream<RawSocketEvent> implements RawSocket {
+  final events = StreamController<RawSocketEvent>(sync: true);
+  var reads = 0;
+
+  @override
+  bool writeEventsEnabled = false;
+  bool _readEventsEnabled = false;
+
+  @override
+  bool get readEventsEnabled => _readEventsEnabled;
+
+  @override
+  set readEventsEnabled(bool enabled) {
+    _readEventsEnabled = enabled;
+    if (enabled) {
+      scheduleMicrotask(() {
+        if (_readEventsEnabled && events.hasListener) {
+          events.add(RawSocketEvent.read);
+        }
+      });
+    }
+  }
+
+  @override
+  StreamSubscription<RawSocketEvent> listen(
+    void Function(RawSocketEvent)? onData, {
+    Function? onError,
+    void Function()? onDone,
+    bool? cancelOnError,
+  }) =>
+      events.stream.listen(onData,
+          onError: onError, onDone: onDone, cancelOnError: cancelOnError);
+
+  @override
+  Uint8List? read([int? len]) {
+    // Nothing to read the first time; the reset arrives with the read event.
+    if (reads++ == 0) return null;
+    _reset('Read failed');
+    return null;
+  }
+
+  @override
+  int write(List<int> buffer, [int offset = 0, int? count]) {
+    _reset('Write failed');
+    return 0;
+  }
+
+  void _reset(String what) {
+    events.addError(SocketException('$what: Connection reset by peer'));
+    scheduleMicrotask(() {
+      if (events.hasListener) events.add(RawSocketEvent.closed);
+      events.close();
+    });
+  }
+
+  @override
+  Future<RawSocket> close() async => this;
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
 void main() {
   test('flush followed by close delivers the complete TCP payload', () async {
     final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
@@ -101,5 +169,28 @@ void main() {
     await raw.writeStarted.future;
     socket.destroy();
     await flushed.timeout(const Duration(seconds: 2));
+  });
+
+  test('a read fails at once when the socket reports a reset synchronously',
+      () async {
+    final raw = _ResetSocket();
+    final channel = RawChannel(raw);
+    await expectLater(
+        channel.read(2).timeout(const Duration(seconds: 2)),
+        throwsA(isA<SocketException>()
+            .having((e) => e.message, 'message', contains('reset'))));
+    expect(raw.reads, 2);
+    expect(channel.isClosed, isTrue);
+  });
+
+  test('a write fails at once when the socket reports a reset synchronously',
+      () async {
+    final raw = _ResetSocket();
+    final channel = RawChannel(raw);
+    await expectLater(
+        channel.write([1, 2, 3]).timeout(const Duration(seconds: 2)),
+        throwsA(isA<SocketException>()
+            .having((e) => e.message, 'message', contains('reset'))));
+    expect(channel.isClosed, isTrue);
   });
 }

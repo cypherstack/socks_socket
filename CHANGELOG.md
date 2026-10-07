@@ -1,3 +1,7 @@
+## Unreleased
+
+- Fail a handshake read or write at once when the socket reports its error synchronously, as macOS does for a reset peer, instead of waiting for the handshake deadline. `SocksConnection` shares the fix.
+
 ## 1.4.0
 
 - Add `SocksConnection.start` for `HttpClient.connectionFactory` (Dart 3.5).

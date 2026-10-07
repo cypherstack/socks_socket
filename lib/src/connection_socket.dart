@@ -79,14 +79,15 @@ class RawChannel {
     final bytes = Uint8List(count);
     var offset = 0;
     while (offset < count) {
-      if (_closed) {
-        throw _error ?? const SocketException('SOCKS transport closed');
-      }
+      _checkOpen();
       final chunk = raw.read(count - offset);
       if (chunk != null) {
         bytes.setRange(offset, offset + chunk.length, chunk);
         offset += chunk.length;
       } else {
+        // A failed read reports its error, and closes this channel, before
+        // returning; a waiter created now would never be completed.
+        _checkOpen();
         if (_readClosed) {
           throw const SocketException('Incomplete SOCKS response');
         }
@@ -101,19 +102,24 @@ class RawChannel {
   Future<void> write(List<int> bytes) async {
     var offset = 0;
     while (offset < bytes.length) {
-      if (_closed) {
-        throw _error ?? const SocketException('SOCKS transport closed');
-      }
+      _checkOpen();
       offset += raw.write(bytes, offset);
+      // A secure socket reports a failed write synchronously, closing this
+      // channel before write() returns; a plain socket defers the report.
+      _checkOpen();
       // Plain sockets may buffer the send; wait until writable before flushing.
       if (offset < bytes.length || raw is! RawSecureSocket) {
         final ready = _writable = Completer<void>();
         raw.writeEventsEnabled = true;
         await ready.future;
-        if (_closed) {
-          throw _error ?? const SocketException('SOCKS transport closed');
-        }
+        _checkOpen();
       }
+    }
+  }
+
+  void _checkOpen() {
+    if (_closed) {
+      throw _error ?? const SocketException('SOCKS transport closed');
     }
   }
 
