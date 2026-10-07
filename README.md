@@ -1,7 +1,7 @@
 # SOCKS sockets
 
-    [![Pub](https://img.shields.io/pub/v/socks_socket.svg)](https://pub.dev/packages/socks_socket)
-    [![GitHub](https://img.shields.io/github/license/stackdump/socks_socket)](
+[![Pub](https://img.shields.io/pub/v/socks_socket.svg)](https://pub.dev/packages/socks_socket)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 SOCKS version 5 sockets for Dart and Flutter, *eg.* ElectrumX and/or Fulcrum over Tor via socket(s).
 
@@ -25,12 +25,18 @@ SOCKS version 5 sockets for Dart and Flutter, *eg.* ElectrumX and/or Fulcrum ove
 See `socks_socket.dart` itself for properties and methods and the example for reference.
 
 ```dart
+import 'dart:io';
+
 import 'package:socks_socket/socks.dart';
+
+// The SOCKS5 port of your Tor instance, for example Tor.instance.port when
+// Tor runs in-app through package:tor_ffi_plugin.
+const proxyPort = 9050;
 
 // Instantiate a socks socket at localhost and on the port selected by the tor service.
 var socksSocket = await SOCKSSocket.create(
     proxyHost: InternetAddress.loopbackIPv4.address,
-    proxyPort: Tor.instance.port,
+    proxyPort: proxyPort,
     sslEnabled: true, // For SSL connections.
 );
 
@@ -54,7 +60,7 @@ await socksSocket.sendServerFeaturesCommand();
 // Configure custom timeouts for slow networks like Tor.
 var socksSocket = await SOCKSSocket.create(
     proxyHost: InternetAddress.loopbackIPv4.address,
-    proxyPort: Tor.instance.port,
+    proxyPort: proxyPort,
     sslEnabled: true,
     handshakeTimeout: Duration(seconds: 60),
     operationTimeout: Duration(seconds: 45),
@@ -67,7 +73,7 @@ var socksSocket = await SOCKSSocket.create(
 // Use isolationToken to request a separate Tor circuit.
 var socksSocket = await SOCKSSocket.create(
     proxyHost: InternetAddress.loopbackIPv4.address,
-    proxyPort: Tor.instance.port,
+    proxyPort: proxyPort,
     sslEnabled: true,
     isolationToken: 'wallet-btc-001',
 );
