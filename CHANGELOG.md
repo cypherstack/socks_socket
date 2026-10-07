@@ -7,6 +7,9 @@
 - `close()` now ends a `reconnect()` or TLS handshake in flight instead of being overtaken by the reconnect or waiting for the handshake deadline.
 - Fail a handshake read or write at once when the socket reports its error synchronously, as macOS does for a reset peer, instead of waiting for the handshake deadline. `SocksConnection` shares the fix.
 - Document that `reconnect()` works after `cancel()`.
+- Drive `SOCKSSocket` from one private lifecycle phase instead of a dozen flags. No API change. `state` now reads `disconnected` as soon as `close()` starts draining, not only once it completes.
+- Carry the plain connection over the same raw channel as TLS and `SocksConnection`, so transport errors read the same on both transports.
+- Read handshake replies straight from the channel, as `SocksConnection` does. A greeting or authentication reply with trailing bytes still fails the handshake, and a stray byte before the CONNECT reply now fails it too instead of being dropped. Handshake failure messages come from the shared protocol code.
 
 ## 1.4.0
 

@@ -74,49 +74,47 @@ enum SocksSocketState {
 
 typedef ConnectionState = SocksSocketState;
 
+/// Where a [SOCKSSocket] is in its life. [SOCKSSocket.state] is derived from it.
+enum _Phase {
+  /// A TCP connection to the proxy is open; [SOCKSSocket.connect] may run.
+  idle,
+
+  /// [SOCKSSocket.connect] is negotiating the greeting.
+  greeting,
+
+  /// The greeting succeeded; [SOCKSSocket.connectTo] may run.
+  greeted,
+
+  /// [SOCKSSocket.connectTo] is requesting the target, then negotiating TLS.
+  requesting,
+  connected,
+
+  /// [SOCKSSocket.close] is draining accepted output.
+  closing,
+
+  /// [SOCKSSocket.cancel] ended a connect; [SOCKSSocket.reconnect] may run.
+  cancelled,
+
+  /// Closed or destroyed; [SOCKSSocket.reconnect] may run.
+  closed,
+
+  /// The handshake or the transport failed; [SOCKSSocket.reconnect] may run.
+  failed,
+}
+
 /// A SOCKS5 socket.
-///
-/// A Dart 3 Socket wrapper that implements the SOCKS5 protocol.  Now with SSL!
-///
-/// Properties:
-///  - [proxyHost]: The host of the SOCKS5 proxy server.
-///  - [proxyPort]: The port of the SOCKS5 proxy server.
-///  - [_socksSocket]: The underlying Socket that connects to the SOCKS5 proxy
-///  server.
-///  - [_responseController]: A StreamController that listens to the
-///  [_socksSocket] and broadcasts the response.
-///
-/// Methods:
-/// - connect: Connects to the SOCKS5 proxy server.
-/// - connectTo: Connects to the specified [domain] and [port] through the
-/// SOCKS5 proxy server.
-/// - write: Converts [object] to a String by invoking [Object.toString] and
-/// sends the encoding of the result to the socket.
-/// - sendServerFeaturesCommand: Sends the server.features command to the
-/// proxy server.
-/// - close: Closes the connection to the Tor proxy.
 ///
 /// Usage:
 /// ```dart
-/// // Instantiate a socks socket at localhost and on the port selected by the
-/// // tor service.
-/// var socksSocket = await SOCKSSocket.create(
-///  proxyHost: InternetAddress.loopbackIPv4.address,
-///  proxyPort: tor.port,
-///  // sslEnabled: true, // For SSL connections.
-///  );
-///
-/// // Connect to the socks instantiated above.
-/// await socksSocket.connect();
-///
-/// // Connect to bitcoincash.stackwallet.com on port 50001 via socks socket.
-/// await socksSocket.connectTo(
-/// 'bitcoincash.stackwallet.com', 50001);
-///
-/// // Send a server features command to the connected socket, see method for
-/// // more specific usage example..
-/// await socksSocket.sendServerFeaturesCommand();
-/// await socksSocket.close();
+/// final socks = await SOCKSSocket.create(
+///   proxyHost: InternetAddress.loopbackIPv4.address,
+///   proxyPort: tor.port,
+///   // sslEnabled: true, // Negotiate TLS with the target after CONNECT.
+/// );
+/// await socks.connect();
+/// await socks.connectTo('bitcoincash.stackwallet.com', 50001);
+/// await socks.sendServerFeaturesCommand();
+/// await socks.close();
 /// ```
 ///
 /// See also:
@@ -128,153 +126,63 @@ class SOCKSSocket {
   /// The port of the SOCKS5 proxy server.
   final int proxyPort;
 
-  /// The underlying Socket that connects to the SOCKS5 proxy server.
-  late Socket _socksSocket;
-
-  Socket get _socket => sslEnabled ? _secureSocksSocket : _socksSocket;
-
-  /// A wrapper around the _socksSocket that enables SSL connections.
-  late Socket _secureSocksSocket;
-
-  bool _nativeSocketOpen = false;
-  bool _nativeSocketNeedsDestroy = false;
-
-  RawChannel? _channel;
-
-  RawChannel? _secureChannel;
-
-  /// A StreamController that listens to the _socksSocket and broadcasts.
-  late StreamController<List<int>> _responseController =
-      _newResponseController();
-
-  /// Bumped on teardown so a replaced connection's callbacks are ignored.
-  int _generation = 0;
-
-  StreamController<List<int>> _newResponseController() {
-    final generation = _generation;
-    return StreamController<List<int>>.broadcast(
-      onListen: () {
-        if (generation == _generation) _resumeApplicationInput();
-      },
-      onCancel: () {
-        if (generation == _generation) _pauseApplicationInput();
-      },
-    );
-  }
-
-  List<int>? _pendingApplicationData;
-  bool _applicationInputPaused = false;
-
-  /// Broadcast: each handshake step listens and cancels in turn.
-  StreamController<List<int>>? _handshakeResponses;
-
-  bool get _handshaking => _state != SocksSocketState.connected;
-
-  void _resumeApplicationInput() {
-    if (_state != SocksSocketState.connected ||
-        !responseController.hasListener) {
-      return;
-    }
-    final pending = _pendingApplicationData;
-    _pendingApplicationData = null;
-    if (pending != null && pending.isNotEmpty) {
-      _responseController.add(pending);
-    }
-    if (_applicationInputPaused) {
-      _applicationInputPaused = false;
-      _subscription?.resume();
-    }
-  }
-
-  void _pauseApplicationInput() {
-    if (_state == SocksSocketState.connected) _pauseInput();
-  }
-
-  void _pauseInput() {
-    if (!_applicationInputPaused) {
-      _applicationInputPaused = true;
-      _subscription?.pause();
-    }
-  }
-
-  /// A StreamController that listens to the _secureSocksSocket and broadcasts.
-  late StreamController<List<int>> _secureResponseController =
-      _newResponseController();
-
-  /// Getter for the StreamController that listens to the _socksSocket and
-  /// broadcasts, or the _secureSocksSocket and broadcasts if SSL is enabled.
-  StreamController<List<int>> get responseController =>
-      sslEnabled ? _secureResponseController : _responseController;
-
-  /// A StreamSubscription that listens to the _socksSocket or the
-  /// _secureSocksSocket if SSL is enabled.
-  StreamSubscription<List<int>>? _subscription;
-
-  /// Getter for the StreamSubscription that listens to the _socksSocket or the
-  /// _secureSocksSocket if SSL is enabled.
-  StreamSubscription<List<int>>? get subscription => _subscription;
-
-  /// Is SSL enabled?
+  /// Whether [connectTo] negotiates TLS with the target.
   final bool sslEnabled;
 
-  /// Current connection state.
-  SocksSocketState _state = SocksSocketState.disconnected;
-
-  /// Peer close or failure is noticed only while [inputStream] has a listener;
-  /// until then a [write] to a dead peer may appear to succeed. With
-  /// `closeOnPeerEof: false`, peer close leaves the state unchanged.
-  SocksSocketState get state => _state;
-
-  /// Target domain for [reconnect].
-  String? _targetDomain;
-
-  /// Target port for [reconnect].
-  int? _targetPort;
-
-  /// Timeout for SOCKS5 handshake and TCP connect.
+  /// Timeout for the TCP connect, each handshake step, and the TLS upgrade.
   final Duration _handshakeTimeout;
 
-  /// Timeout for socket flush after [write].
+  /// Timeout for flushing a write, and for draining output in [close].
   final Duration _operationTimeout;
-
-  static const int _maxHandshakeBuffer = 1024;
-
-  _SocketOutputSink? _outputSink;
-  Future<void> _writeTail = Future<void>.value();
-  Object? _writeFailure;
-  StackTrace? _writeFailureStack;
-  Future<void>? _closeFuture;
-  bool _closing = false;
-
-  /// Set by [close] and [destroy]; a [reconnect] in flight stops at its next
-  /// step instead of opening a connection the caller has already given up.
-  bool _closeRequested = false;
-  bool _peerReadClosed = false;
 
   /// Accept bad certificates (testing only).
   final bool _allowBadCertificates;
 
   final SecurityContext? _securityContext;
 
-  /// Cancel signal for in-flight operations.
-  Completer<Never>? _cancelCompleter;
-
-  /// The proxy TCP connect in flight, so [close] and [destroy] can end it.
-  ConnectionTask<Object>? _connectTask;
-  bool _cancelled = false;
-  bool _greetingStarted = false;
-  bool _greetingComplete = false;
-  bool _requestStarted = false;
-  bool _reconnecting = false;
-
-  /// Tor circuit isolation token (RFC 1929 username/password auth).
-  String? _isolationToken;
-
   final bool? _requireIsolation;
 
   final bool _closeOnPeerEof;
 
-  /// Private constructor.
+  /// Tor circuit isolation token (RFC 1929 username/password auth).
+  String? _isolationToken;
+
+  /// Target of the last [connectTo], for [reconnect].
+  String? _targetDomain;
+  int? _targetPort;
+
+  _Phase _phase = _Phase.idle;
+
+  /// The connection to the proxy: a raw TCP channel until [connectTo] has
+  /// negotiated TLS, then the TLS channel.
+  RawChannel? _channel;
+
+  /// [_channel] as a [Socket], once connected.
+  Socket? _transport;
+
+  /// Reads [_transport] into [_input]; paused while [_input] has no listener.
+  StreamSubscription<List<int>>? _subscription;
+
+  /// The proxy TCP connect in flight, so [close] and [destroy] can end it.
+  ConnectionTask<RawSocket>? _connectTask;
+
+  /// Ends the handshake in flight; see [_signalCancel].
+  Completer<Never>? _cancel;
+
+  late StreamController<List<int>> _input = _newInput();
+
+  _SocketOutputSink? _outputSink;
+  Future<void> _writeTail = Future<void>.value();
+  Object? _writeFailure;
+  StackTrace? _writeFailureStack;
+
+  Future<void>? _closeFuture;
+
+  /// Set by [close] and [destroy]; a [reconnect] in flight stops at its next
+  /// step instead of opening a connection the caller has already given up.
+  bool _closeRequested = false;
+  bool _reconnecting = false;
+
   SOCKSSocket._(
       this.proxyHost,
       this.proxyPort,
@@ -286,36 +194,6 @@ class SOCKSSocket {
       this._securityContext,
       this._requireIsolation,
       this._closeOnPeerEof);
-
-  /// Provides a stream of data as List<int>.
-  ///
-  /// Reads pause while there is no listener; earlier data is kept.
-  Stream<List<int>> get inputStream => sslEnabled
-      ? _secureResponseController.stream
-      : _responseController.stream;
-
-  StreamSink<List<int>> get outputStream => _outputSink ??= _newOutputSink();
-
-  _SocketOutputSink _newOutputSink() {
-    final generation = _generation;
-    final sink = _SocketOutputSink(_queueSinkWrite, (error, stack) {
-      if (generation == _generation) _failWrites(error, stack);
-    });
-    if (_writeFailure != null) {
-      sink._stop(_writeFailure!, _writeFailureStack!);
-    } else if (_closing) {
-      sink.close().ignore();
-    }
-    return sink;
-  }
-
-  Future<void> _queueSinkWrite(List<int> data) {
-    if (!_canQueueWrite(allowClosing: true)) {
-      throw StateError(
-          'Cannot write: socket is not connected (state: $_state)');
-    }
-    return _queueWrite(data, allowClosing: true);
-  }
 
   /// Creates a SOCKS5 socket to the specified [proxyHost] and [proxyPort].
   ///
@@ -341,9 +219,7 @@ class SOCKSSocket {
         'requireIsolation',
       );
     }
-
-    // Create a SOCKS socket instance.
-    var instance = SOCKSSocket._(
+    final instance = SOCKSSocket._(
         proxyHost,
         proxyPort,
         sslEnabled,
@@ -354,15 +230,11 @@ class SOCKSSocket {
         securityContext,
         requireIsolation,
         closeOnPeerEof);
-
-    // Initialize the SOCKS socket.
     await instance._init();
-
-    // Return the SOCKS socket instance.
     return instance;
   }
 
-  /// Deprecated. Does not await _init(); use [SOCKSSocket.create].
+  /// Deprecated. Does not await the proxy connection; use [SOCKSSocket.create].
   @Deprecated('Use SOCKSSocket.create() instead')
   SOCKSSocket({
     required this.proxyHost,
@@ -378,72 +250,92 @@ class SOCKSSocket {
     _init();
   }
 
-  /// Initializes the SOCKS socket.
-  ///
-  /// This method is a private method that is called by the constructor.
-  ///
-  /// Returns:
-  ///   A Future that resolves to void.
-  Future<void> _init() async {
-    // Connect to the SOCKS proxy server.
-    _applicationInputPaused = false;
-    _cancelled = false;
-    _greetingStarted = false;
-    _greetingComplete = false;
-    _requestStarted = false;
-    _peerReadClosed = false;
-    if (sslEnabled) {
-      final raw = await _connectProxy(RawSocket.startConnect);
-      _channel = RawChannel(raw);
-      _socksSocket = _channel!.socket();
-    } else {
-      _socksSocket = await _connectProxy(Socket.startConnect);
-      _nativeSocketOpen = true;
-      _nativeSocketNeedsDestroy = true;
-      _socksSocket.done.then<void>((_) {
-        _nativeSocketOpen = false;
-      }, onError: (Object _) {
-        _nativeSocketOpen = false;
-      });
-    }
-    _secureChannel = null;
-    final responses = _responseController;
-    final handshake = _handshakeResponses = StreamController.broadcast();
-
-    // Listen to the socket.
-    _subscription = _socksSocket.listen(
-      (data) {
-        (_handshaking ? handshake : _responseController).add(data);
-      },
-      onError: (Object e, StackTrace stack) {
-        final error = e is SocksException
-            ? e
-            : SocksConnectionException(
-                message: 'SOCKS5 connection error: $e',
-              );
-        if (_handshaking && !handshake.isClosed) handshake.addError(error);
-        if (!responses.isClosed) responses.addError(error);
-        if (_state == SocksSocketState.connected) _failWrites(error, stack);
-      },
-      onDone: () {
-        // Close the response controller when the socket is closed.
-        if (!handshake.isClosed) handshake.close();
-        if (!_sslUpgraded) {
-          if (_state == SocksSocketState.connected) _peerClosed();
-          if (!responses.isClosed) responses.close();
-        }
-      },
-    );
+  static void _checkIsolationToken(String? token) {
+    if (token != null) encodeSocksCredentials(token, token);
   }
 
-  Future<T> _connectProxy<T extends Object>(
-      Future<ConnectionTask<T>> Function(String host, int port) start) async {
-    final task = _connectTask = await start(proxyHost, proxyPort);
-    // A close() or destroy() while the task was being created found
-    // nothing to cancel yet.
+  /// Current connection state.
+  ///
+  /// Peer close or failure is noticed only while [inputStream] has a listener;
+  /// until then a [write] to a dead peer may appear to succeed. With
+  /// `closeOnPeerEof: false`, peer close leaves the state unchanged.
+  SocksSocketState get state => switch (_phase) {
+        _Phase.idle ||
+        _Phase.closing ||
+        _Phase.cancelled ||
+        _Phase.closed =>
+          SocksSocketState.disconnected,
+        _Phase.greeting ||
+        _Phase.greeted ||
+        _Phase.requesting =>
+          SocksSocketState.connecting,
+        _Phase.connected => SocksSocketState.connected,
+        _Phase.failed => SocksSocketState.error,
+      };
+
+  bool get _connecting =>
+      _phase == _Phase.greeting ||
+      _phase == _Phase.greeted ||
+      _phase == _Phase.requesting;
+
+  /// Whether [close], [cancel] or [destroy] has given the connection up.
+  bool get _givenUp =>
+      _phase == _Phase.closing ||
+      _phase == _Phase.cancelled ||
+      _phase == _Phase.closed;
+
+  /// Data from the target, as List<int>.
+  ///
+  /// Reads pause while there is no listener; earlier data is kept.
+  Stream<List<int>> get inputStream => _input.stream;
+
+  /// The controller behind [inputStream].
+  StreamController<List<int>> get responseController => _input;
+
+  /// The subscription that feeds [inputStream], once connected.
+  StreamSubscription<List<int>>? get subscription => _subscription;
+
+  StreamSink<List<int>> get outputStream => _outputSink ??= _newOutputSink();
+
+  StreamController<List<int>> _newInput() {
+    late final StreamController<List<int>> input;
+    input = StreamController<List<int>>.broadcast(
+      onListen: () {
+        if (identical(input, _input)) _subscription?.resume();
+      },
+      onCancel: () {
+        if (identical(input, _input)) _subscription?.pause();
+      },
+    );
+    return input;
+  }
+
+  _SocketOutputSink _newOutputSink() {
+    late final _SocketOutputSink sink;
+    sink = _SocketOutputSink(_queueSinkWrite, (error, stack) {
+      if (identical(sink, _outputSink)) _fail(error, stack, _Phase.failed);
+    });
+    if (_writeFailure != null) {
+      sink._stop(_writeFailure!, _writeFailureStack!);
+    } else if (_phase == _Phase.closing || _phase == _Phase.closed) {
+      sink.close().ignore();
+    }
+    return sink;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Connecting.
+
+  /// Opens the TCP connection to the proxy.
+  Future<void> _init() async {
+    final task =
+        _connectTask = await RawSocket.startConnect(proxyHost, proxyPort);
+    // A close() or destroy() while the task was being created found nothing
+    // to cancel yet.
     if (_closeRequested) task.cancel();
+    final RawSocket raw;
     try {
-      return await task.socket.timeout(_handshakeTimeout, onTimeout: () {
+      raw = await task.socket.timeout(_handshakeTimeout, onTimeout: () {
         task.cancel();
         throw SocketException(
             'Connection timed out, host: $proxyHost, port: $proxyPort');
@@ -451,194 +343,45 @@ class SOCKSSocket {
     } finally {
       _connectTask = null;
     }
+    _channel = RawChannel(raw);
+    _cancel = Completer<Never>()..future.ignore();
   }
 
-  /// The peer stopped sending; writes already accepted are still delivered.
-  void _peerClosed() {
-    _peerReadClosed = true;
-    if (!_closeOnPeerEof) return;
-    _state = SocksSocketState.disconnected;
-    _ensureClosed().ignore();
-  }
-
-  void _destroyTransport() {
-    // After the TLS upgrade the secure channel owns and drains the raw socket.
-    (_secureChannel ?? _channel)?.destroy();
-    // Sink completion does not cancel a paused addStream source after a reset.
-    // Destroy every native transport we own, even when its done has completed.
-    if (_nativeSocketNeedsDestroy) {
-      _nativeSocketNeedsDestroy = false;
-      _nativeSocketOpen = false;
-      _socksSocket.destroy();
-    }
-  }
-
-  /// Closes controllers directly; a paused input subscription never sees done.
-  void _abandonConnection() {
-    _destroyTransport();
-    if (!_responseController.isClosed) _responseController.close();
-    if (!_secureResponseController.isClosed) {
-      _secureResponseController.close();
-    }
-  }
-
-  /// Accumulates [expectedLength] bytes from the response stream.
-  Future<List<int>> _waitForResponse(int expectedLength) =>
-      _waitForReply((_) => expectedLength, allowTrailing: false);
-
-  /// Accumulates a variable-length SOCKS5 connect response.
-  Future<List<int>> _waitForConnectResponse() =>
-      _waitForReply(socksConnectReplyLength, allowTrailing: true);
-
-  Future<List<int>> _waitForReply(
-    int? Function(List<int> buffer) lengthOf, {
-    required bool allowTrailing,
-  }) {
-    final completer = Completer<List<int>>();
-    final buffer = <int>[];
-    late final StreamSubscription<List<int>> sub;
-
-    void fail(String reason) {
-      sub.cancel();
-      if (!completer.isCompleted) {
-        completer.completeError(
-          SocksHandshakeException(
-            proxyHost: proxyHost,
-            proxyPort: proxyPort,
-            message: 'SOCKS5 $reason (proxy: $proxyHost:$proxyPort).',
-          ),
-        );
-      }
-    }
-
-    sub = _handshakeResponses!.stream.listen(
-      (data) {
-        buffer.addAll(data);
-        final expectedLength = lengthOf(buffer);
-        if (buffer.length >= _maxHandshakeBuffer &&
-            (expectedLength == null || buffer.length < expectedLength)) {
-          fail('handshake buffer overflow');
-          return;
-        }
-        if (expectedLength == null || buffer.length < expectedLength) return;
-        if (expectedLength < 0) {
-          fail('reply is malformed');
-        } else if (!allowTrailing && buffer.length > expectedLength) {
-          fail('reply has unexpected trailing data');
-        } else {
-          sub.cancel();
-          if (!completer.isCompleted) {
-            if (allowTrailing && expectedLength > 0 && !sslEnabled) {
-              _pendingApplicationData = buffer.sublist(expectedLength);
-              _pauseInput();
-            }
-            completer.complete(buffer.sublist(0, expectedLength));
-          }
-        }
-      },
-      onError: (e) {
-        sub.cancel();
-        if (!completer.isCompleted) {
-          completer.completeError(e);
-        }
-      },
-      onDone: () {
-        if (!completer.isCompleted) {
-          completer.completeError(
-            SocksConnectionException(
-              message: 'Connection closed before SOCKS5 response received '
-                  '(proxy: $proxyHost:$proxyPort).',
-            ),
-          );
-        }
-      },
-    );
-
-    final dataFuture = completer.future.timeout(
-      _handshakeTimeout,
-      onTimeout: () {
-        sub.cancel();
-        throw TimeoutException('SOCKS5 handshake timed out after '
-            '${_handshakeTimeout.inSeconds} seconds.');
-      },
-    );
-
-    final cancel = _cancelCompleter;
-    if (cancel != null) {
-      return Future.any<List<int>>([dataFuture, cancel.future]);
-    }
-    return dataFuture;
-  }
-
-  static void _checkIsolationToken(String? token) {
-    if (token != null) encodeSocksCredentials(token, token);
-  }
-
-  Future<void> _writeHandshake(List<int> bytes) async =>
-      _socksSocket.add(bytes);
-
-  /// Connects to the SOCKS socket.
-  ///
-  /// Returns:
-  ///  A Future that resolves to void.
+  /// Negotiates the SOCKS5 greeting with the proxy.
   Future<void> connect() async {
     _checkNotReconnecting();
     return _connect();
   }
 
   Future<void> _connect() async {
-    if (_greetingStarted ||
-        _closing ||
-        _state != SocksSocketState.disconnected) {
+    if (_phase != _Phase.idle) {
       throw StateError(
           'Cannot connect: use reconnect() for another connection');
     }
-    _greetingStarted = true;
-    _cancelCompleter = Completer<Never>()..future.ignore();
-    _state = SocksSocketState.connecting;
+    final channel = _channel;
+    if (channel == null) {
+      // The deprecated constructor does not await the proxy connection.
+      throw StateError('Cannot connect: the proxy connection is not open yet');
+    }
+    _phase = _Phase.greeting;
     try {
-      await negotiateSocks(
-        write: _writeHandshake,
-        read: _waitForResponse,
-        credentials: _isolationToken == null
-            ? null
-            : encodeSocksCredentials(_isolationToken!, _isolationToken!),
-        allowNoAuthFallback: !(_requireIsolation ?? _isolationToken != null),
-      );
-      if (_cancelled) {
-        throw SocksCancelledException(message: 'SOCKS5 connection cancelled.');
-      }
-      _greetingComplete = true;
-    } on SocksProtocolFailure catch (error) {
-      _cancelCompleter = null;
-      if (_closing) throw _closedBeforeConnected();
-      _state = SocksSocketState.error;
-      _abandonConnection();
-      throw SocksHandshakeException(
-          proxyHost: proxyHost,
-          proxyPort: proxyPort,
-          message: 'SOCKS5 handshake failed: ${error.message}');
-    } catch (e) {
-      _cancelCompleter = null;
-      if (e is SocksCancelledException) rethrow;
-      if (_closing) throw _closedBeforeConnected();
-      _state = SocksSocketState.error;
-      _abandonConnection();
-      rethrow;
+      await _handshake(() => negotiateSocks(
+            write: channel.write,
+            read: (count) => _readReply(channel, count),
+            credentials: _isolationToken == null
+                ? null
+                : encodeSocksCredentials(_isolationToken!, _isolationToken!),
+            allowNoAuthFallback:
+                !(_requireIsolation ?? _isolationToken != null),
+          ));
+      _phase = _Phase.greeted;
+    } catch (error) {
+      throw _handshakeFailed(error, 'SOCKS5 handshake failed: ');
     }
   }
 
-  SocksCancelledException _closedBeforeConnected() => SocksCancelledException(
-      message: 'SOCKS5 connection closed before it was established.');
-
-  /// Connects to the specified [domain] and [port] through the SOCKS socket.
-  ///
-  /// Parameters:
-  /// - [domain]: The domain to connect to.
-  /// - [port]: The port to connect to.
-  ///
-  /// Returns:
-  ///   A Future that resolves to void.
+  /// Asks the proxy to connect to [domain]:[port], then negotiates TLS with
+  /// the target if [sslEnabled].
   Future<void> connectTo(String domain, int port) async {
     _checkNotReconnecting();
     return _connectTo(domain, port);
@@ -649,57 +392,25 @@ class SOCKSSocket {
   }
 
   Future<void> _connectTo(String domain, int port) async {
-    if (_cancelled) {
+    if (_phase == _Phase.cancelled) {
       throw SocksCancelledException(message: 'SOCKS5 connection cancelled.');
     }
-    if (_state != SocksSocketState.connecting ||
-        !_greetingComplete ||
-        _requestStarted ||
-        _closing) {
+    if (_phase != _Phase.greeted) {
       throw StateError(
           'Cannot connectTo: must call connect() and await it before one connectTo()');
     }
-
     final request = encodeSocksDestination(domain, port);
-
-    _requestStarted = true;
+    _phase = _Phase.requesting;
     _targetDomain = domain;
     _targetPort = port;
-
+    final channel = _channel!;
     try {
-      _socksSocket.add(request);
-      final response = await _waitForConnectResponse();
-      try {
-        checkSocksConnectReply(response);
-      } on SocksProtocolFailure catch (error) {
-        if (error.replyCode != null) {
-          final replyCode = SocksReplyCode.fromByte(error.replyCode!);
-          throw SocksRequestException(
-            replyCode: replyCode,
-            proxyHost: proxyHost,
-            proxyPort: proxyPort,
-            targetDomain: domain,
-            targetPort: port,
-            message: 'SOCKS5 request failed (proxy: $proxyHost:$proxyPort, '
-                'target: $domain:$port, reply: '
-                '${replyCode?.description ?? "unknown (0x${error.replyCode!.toRadixString(16).padLeft(2, '0')})"})',
-          );
-        }
-        throw SocksHandshakeException(
-            proxyHost: proxyHost, proxyPort: proxyPort, message: error.message);
-      }
-
-      // Upgrade to SSL if needed.
+      await _handshake(() async {
+        await channel.write(request);
+        checkSocksConnectReply(await _readConnectReply(channel));
+      });
       if (sslEnabled) {
-        final channel = _channel!;
-        final deadline = Completer<RawSecureSocket>()..future.ignore();
-        final timer = Timer(_handshakeTimeout, () {
-          channel.destroy();
-          deadline.completeError(
-              TimeoutException('SOCKS5 SSL handshake timed out after '
-                  '${_handshakeTimeout.inSeconds} seconds.'));
-        });
-        final handshake = RawSecureSocket.secure(
+        final upgrade = RawSecureSocket.secure(
           channel.raw,
           subscription: channel.detach(),
           host: domain,
@@ -707,72 +418,120 @@ class SOCKSSocket {
           onBadCertificate: _allowBadCertificates ? (_) => true : null,
         );
         try {
-          // Upgrade to SSL.
-          final secured = await Future.any<RawSecureSocket>([
-            handshake,
-            deadline.future,
-            if (_cancelCompleter != null) _cancelCompleter!.future,
-          ]);
-          final secureChannel = _secureChannel = RawChannel(secured);
-          _secureSocksSocket = secureChannel.socket();
-          _sslUpgraded = true;
-          final responses = _secureResponseController;
-
-          // Listen to the secure socket.
-          _subscription = _secureSocksSocket.listen(
-            (data) {
-              // Add the data to the response controller.
-              responses.add(data);
-            },
-            onError: (Object e, StackTrace stack) {
-              final error = e is SocksException
-                  ? e
-                  : SocksConnectionException(
-                      message: 'SOCKS5 connection error: $e',
-                    );
-              if (!responses.isClosed) responses.addError(error);
-              if (_state == SocksSocketState.connected) {
-                _failWrites(error, stack);
-              }
-            },
-            onDone: () {
-              if (_state == SocksSocketState.connected) _peerClosed();
-              if (!responses.isClosed) responses.close();
-            },
-          );
-          _pauseInput();
-        } catch (e) {
-          handshake.then<void>((s) => s.close(), onError: (_) {});
-          if (_cancelCompleter?.isCompleted == true) {
-            throw SocksCancelledException(
-              message: 'SOCKS5 connection cancelled during SSL upgrade.',
-            );
-          }
+          _channel = RawChannel(await _handshake(() => upgrade));
+        } catch (_) {
+          // The upgrade may still succeed after a timeout or cancellation.
+          upgrade.then<void>((s) => s.close(), onError: (_) {});
           rethrow;
-        } finally {
-          timer.cancel();
         }
       }
+    } catch (error) {
+      throw _handshakeFailed(error, '', domain: domain, port: port);
+    }
+    final transport = _transport = _channel!.socket();
+    _subscription = transport.listen(
+      _input.add,
+      onError: (Object e, StackTrace stack) {
+        final error = e is SocksException
+            ? e
+            : SocksConnectionException(message: 'SOCKS5 connection error: $e');
+        if (!_input.isClosed) _input.addError(error);
+        if (_phase == _Phase.connected) _fail(error, stack, _Phase.failed);
+      },
+      onDone: () {
+        if (_phase == _Phase.connected && _closeOnPeerEof) {
+          _ensureClosed().ignore();
+        }
+        if (!_input.isClosed) _input.close();
+      },
+    );
+    _phase = _Phase.connected;
+    _cancel = null;
+    if (!_input.hasListener) _subscription!.pause();
+  }
 
-      // Check if cancelled between handshake completion and state transition.
-      if (_cancelCompleter?.isCompleted == true) {
-        throw SocksCancelledException(
-          message: 'SOCKS5 connection cancelled.',
+  /// Runs one handshake [step] against the handshake deadline and the cancel
+  /// signal. A cancellation that lands as the step completes still wins.
+  Future<T> _handshake<T>(Future<T> Function() step) async {
+    final cancel = _cancel!;
+    final result = await Future.any<T>([step(), cancel.future]).timeout(
+      _handshakeTimeout,
+      onTimeout: () => throw TimeoutException('SOCKS5 handshake timed out '
+          'after ${_handshakeTimeout.inSeconds} seconds.'),
+    );
+    if (cancel.isCompleted) await cancel.future;
+    return result;
+  }
+
+  /// Reads a fixed-size greeting or authentication reply. Bytes beyond it
+  /// have no place in the protocol here, so they fail the handshake.
+  Future<List<int>> _readReply(RawChannel channel, int count) async {
+    final reply = await channel.read(count);
+    if (channel.raw.available() > 0) {
+      throw const SocksProtocolFailure('reply has unexpected trailing data');
+    }
+    return reply;
+  }
+
+  /// Reads the variable-length CONNECT reply. Bytes after it belong to the
+  /// target and stay in the socket for [inputStream].
+  Future<List<int>> _readConnectReply(RawChannel channel) async {
+    final reply = <int>[...await channel.read(4)];
+    var length = socksConnectReplyLength(reply);
+    if (length == null) {
+      reply.addAll(await channel.read(1));
+      length = socksConnectReplyLength(reply);
+    }
+    if (length != null && length > reply.length) {
+      reply.addAll(await channel.read(length - reply.length));
+    }
+    return reply;
+  }
+
+  /// Tears down after a failed handshake step and maps [error] to what the
+  /// caller sees. Cancellation, [close] and [destroy] report as such.
+  Object _handshakeFailed(Object error, String prefix,
+      {String? domain, int? port}) {
+    _cancel = null;
+    if (error is SocksCancelledException) return error;
+    if (_phase == _Phase.cancelled) {
+      return SocksCancelledException(message: 'SOCKS5 connection cancelled.');
+    }
+    if (_givenUp) return _closedBeforeConnected();
+    _abandon(_Phase.failed);
+    if (error is SocksProtocolFailure) {
+      final replyCode = error.replyCode;
+      if (replyCode != null) {
+        final reply = SocksReplyCode.fromByte(replyCode);
+        return SocksRequestException(
+          replyCode: reply,
+          proxyHost: proxyHost,
+          proxyPort: proxyPort,
+          targetDomain: domain!,
+          targetPort: port!,
+          message: 'SOCKS5 request failed (proxy: $proxyHost:$proxyPort, '
+              'target: $domain:$port, reply: '
+              '${reply?.description ?? "unknown (0x${replyCode.toRadixString(16).padLeft(2, '0')})"})',
         );
       }
-
-      _state = SocksSocketState.connected;
-      _cancelCompleter = null;
-      _resumeApplicationInput();
-    } catch (e) {
-      _cancelCompleter = null;
-      if (e is SocksCancelledException) rethrow;
-      if (_closing) throw _closedBeforeConnected();
-      _state = SocksSocketState.error;
-      _abandonConnection();
-      rethrow;
+      return SocksHandshakeException(
+          proxyHost: proxyHost,
+          proxyPort: proxyPort,
+          message: '$prefix${error.message}');
     }
+    if (error is SocketException) {
+      return SocksConnectionException(
+          message: 'Connection closed before SOCKS5 response received '
+              '(proxy: $proxyHost:$proxyPort): ${error.message}');
+    }
+    return error;
   }
+
+  SocksCancelledException _closedBeforeConnected() => SocksCancelledException(
+      message: 'SOCKS5 connection closed before it was established.');
+
+  // ---------------------------------------------------------------------------
+  // Writing.
 
   /// Writes [object] to the socket. If [newline] is true, appends '\n'.
   Future<void> write(Object? object, {bool newline = false}) async {
@@ -781,31 +540,26 @@ class SOCKSSocket {
     await _queueWrite(newline ? [...data, 0x0A] : data);
   }
 
-  bool _canQueueWrite({bool allowClosing = false}) {
-    if (_closing && !allowClosing) return false;
-    // close() rejects new sink operations, but an already accepted addStream
-    // still feeds chunks after read-side EOF until it finishes or times out.
-    return _state == SocksSocketState.connected ||
-        (allowClosing &&
-            _closing &&
-            _peerReadClosed &&
-            _state == SocksSocketState.disconnected);
-  }
+  /// close() rejects new sink operations, but an addStream it accepted still
+  /// feeds chunks while output drains.
+  Future<void> _queueSinkWrite(List<int> data) =>
+      _queueWrite(data, draining: _phase == _Phase.closing);
 
-  Future<void> _queueWrite(List<int> data, {bool allowClosing = false}) {
-    if (!_canQueueWrite(allowClosing: allowClosing)) {
-      return Future<void>.error(
-          StateError('Cannot write: socket is not connected (state: $_state)'));
+  /// Throws synchronously when not writable, so a bound stream ends with the
+  /// [StateError] instead of failing the connection.
+  Future<void> _queueWrite(List<int> data, {bool draining = false}) {
+    if (!(_phase == _Phase.connected || draining)) {
+      throw StateError('Cannot write: socket is not connected (state: $state)');
     }
+    final transport = _transport!;
     final bytes = List<int>.of(data);
-    final generation = _generation;
     final writing = _writeTail.then((_) async {
       if (_writeFailure != null) {
         Error.throwWithStackTrace(_writeFailure!, _writeFailureStack!);
       }
       try {
-        _socket.add(bytes);
-        await _socket.flush().timeout(_operationTimeout);
+        transport.add(bytes);
+        await transport.flush().timeout(_operationTimeout);
         // A transport destroyed mid-flush can still complete the flush.
         if (_writeFailure != null) {
           Error.throwWithStackTrace(_writeFailure!, _writeFailureStack!);
@@ -819,7 +573,9 @@ class SOCKSSocket {
         final error = e is SocksException || e is TimeoutException
             ? e
             : SocksConnectionException(message: 'SOCKS5 write failed: $e');
-        if (generation == _generation) _failWrites(error, stack);
+        if (identical(transport, _transport)) {
+          _fail(error, stack, _Phase.failed);
+        }
         Error.throwWithStackTrace(error, stack);
       }
     });
@@ -828,21 +584,13 @@ class SOCKSSocket {
     return writing;
   }
 
-  void _failWrites(Object error, StackTrace stack) {
-    _writeFailure ??= error;
-    _writeFailureStack ??= stack;
-    _state = SocksSocketState.error;
-    _outputSink?._stop(error, stack);
-    _abandonConnection();
-  }
+  // ---------------------------------------------------------------------------
+  // Ending.
 
-  /// Whether SSL upgrade consumed the raw socket.
-  bool _sslUpgraded = false;
-
-  /// Closes the connection to the Tor proxy.
+  /// Drains accepted output, then closes the connection.
   ///
-  /// Returns:
-  ///  A Future that resolves to void.
+  /// Rethrows a write failure that already ended the connection. A [close]
+  /// or [destroy] while [reconnect] is in progress cancels the reconnect.
   Future<void> close() {
     _closeRequested = true;
     return _ensureClosed();
@@ -861,99 +609,85 @@ class SOCKSSocket {
     _signalCancel(
       SocksCancelledException(message: 'SOCKS5 connection destroyed.'),
     );
-    _failWrites(
+    _fail(
       SocksConnectionException(message: 'SOCKS5 connection destroyed'),
       StackTrace.current,
+      _Phase.closed,
     );
-    _state = SocksSocketState.disconnected;
     // A close already draining fails once its writes do; keep its outcome for
     // the caller that started it, but let a later close() complete normally.
     _closeFuture = (_closeFuture ?? _close()).catchError((Object _) {});
-  }
-
-  /// Ends a connect in flight. The TLS handshake cannot notice a destroyed
-  /// transport on its own, so it waits for this or for its deadline.
-  void _signalCancel(SocksCancelledException error) {
-    _connectTask?.cancel();
-    final cancel = _cancelCompleter;
-    if (cancel != null && !cancel.isCompleted) cancel.completeError(error);
-  }
-
-  Future<void> _close() async {
-    _closing = true;
-    _signalCancel(_closedBeforeConnected());
-    final upgraded = sslEnabled && _sslUpgraded;
-    final channel = upgraded ? _secureChannel : _channel;
-    var flushed = false;
-    // Ensure all data is sent before closing.
-    try {
-      await _outputSink?.close().timeout(_operationTimeout);
-      await _writeTail;
-      final open = _nativeSocketOpen || (channel != null && !channel.isClosed);
-      if (open && _writeFailure == null) {
-        await (upgraded ? _secureSocksSocket : _socksSocket)
-            .flush()
-            .timeout(_operationTimeout);
-        flushed = true;
-      }
-    } catch (error, stack) {
-      _outputSink?._stop(error, stack);
-      rethrow;
-    } finally {
-      _generation++;
-      _state = SocksSocketState.disconnected;
-      if (flushed) {
-        await (upgraded ? _secureSocksSocket : _socksSocket)
-            .close()
-            .then<void>((_) {}, onError: (_) {});
-      }
-      await _subscription?.cancel();
-      _destroyTransport();
-      _closeHandshakeResponses();
-      if (!_secureResponseController.isClosed) {
-        _secureResponseController.close();
-      }
-      if (!_responseController.isClosed) {
-        _responseController.close();
-      }
-      _sslUpgraded = false;
-    }
   }
 
   /// Cancels an in-flight connect operation. No-op if not connecting.
   /// Once a target is known, [reconnect] opens a new connection; to end a
   /// reconnect in progress, use [close] or [destroy].
   Future<void> cancel() async {
-    if (_state != SocksSocketState.connecting) return;
-
-    final c = _cancelCompleter;
-    if (c == null || c.isCompleted) return;
-
-    _cancelled = true;
-    _state = SocksSocketState.disconnected;
-    c.completeError(
-      SocksCancelledException(
-        message: 'SOCKS5 connection cancelled.',
-      ),
+    if (!_connecting) return;
+    _signalCancel(
+      SocksCancelledException(message: 'SOCKS5 connection cancelled.'),
     );
-
-    // Destroy socket to force pending operations to fail.
-    _destroyTransport();
-
-    await _subscription?.cancel();
+    _abandon(_Phase.cancelled);
     _outputSink?.close().ignore();
-    _closeHandshakeResponses();
-    if (!_responseController.isClosed) _responseController.close();
-    if (!_secureResponseController.isClosed) {
-      _secureResponseController.close();
-    }
-
-    _state = SocksSocketState.disconnected;
   }
 
-  void _closeHandshakeResponses() {
-    final handshake = _handshakeResponses;
-    if (handshake != null && !handshake.isClosed) handshake.close();
+  /// Ends a connect in flight. The TLS handshake cannot notice a destroyed
+  /// transport on its own, so it waits for this or for its deadline.
+  void _signalCancel(SocksCancelledException error) {
+    _connectTask?.cancel();
+    final cancel = _cancel;
+    if (cancel != null && !cancel.isCompleted) cancel.completeError(error);
+  }
+
+  /// Records a failure, fails pending output, and tears down into [phase].
+  void _fail(Object error, StackTrace stack, _Phase phase) {
+    _writeFailure ??= error;
+    _writeFailureStack ??= stack;
+    _outputSink?._stop(error, stack);
+    _abandon(phase);
+  }
+
+  /// Destroys the transport and ends [inputStream] without draining; a paused
+  /// input subscription would never see done otherwise. A closed socket stays
+  /// closed: failures its teardown provokes are not news.
+  void _abandon(_Phase phase) {
+    if (_phase != _Phase.closed) _phase = phase;
+    _channel?.destroy();
+    if (!_input.isClosed) _input.close();
+  }
+
+  Future<void> _close() async {
+    _signalCancel(_closedBeforeConnected());
+    _phase = switch (_phase) {
+      _Phase.connected => _Phase.closing,
+      _Phase.failed => _Phase.failed,
+      _ => _Phase.closed,
+    };
+    final channel = _channel;
+    final transport = _transport;
+    var flushed = false;
+    try {
+      await _outputSink?.close().timeout(_operationTimeout);
+      await _writeTail;
+      if (transport != null &&
+          channel != null &&
+          !channel.isClosed &&
+          _writeFailure == null) {
+        await transport.flush().timeout(_operationTimeout);
+        flushed = true;
+      }
+    } catch (error, stack) {
+      _outputSink?._stop(error, stack);
+      rethrow;
+    } finally {
+      _phase = _Phase.closed;
+      if (flushed) {
+        await transport!.close().then<void>((_) {}, onError: (_) {});
+      }
+      await _subscription?.cancel();
+      channel?.destroy();
+      if (!_input.isClosed) _input.close();
+    }
   }
 
   /// Reconnects to the previously connected target.
@@ -978,11 +712,8 @@ class SOCKSSocket {
       throw StateError('Cannot reconnect: no target known. '
           'Call connectTo() before reconnect().');
     }
-
     _checkIsolationToken(isolationToken);
-    if (isolationToken != null) {
-      _isolationToken = isolationToken;
-    }
+    if (isolationToken != null) _isolationToken = isolationToken;
 
     _closeRequested = false;
     try {
@@ -993,15 +724,15 @@ class SOCKSSocket {
     _checkReconnectAborted();
 
     // Broadcast controllers can't be reused after close.
-    _pendingApplicationData = null;
-    _responseController = _newResponseController();
-    _secureResponseController = _newResponseController();
+    _input = _newInput();
+    _transport = null;
+    _subscription = null;
     _outputSink = null;
     _writeTail = Future<void>.value();
     _writeFailure = null;
     _writeFailureStack = null;
     _closeFuture = null;
-    _closing = false;
+    _phase = _Phase.idle;
 
     try {
       await _init();
@@ -1012,9 +743,7 @@ class SOCKSSocket {
       _checkReconnectAborted();
     } catch (error) {
       final cancelled = error is SocksCancelledException || _closeRequested;
-      _state =
-          cancelled ? SocksSocketState.disconnected : SocksSocketState.error;
-      _abandonConnection();
+      _abandon(cancelled ? _Phase.closed : _Phase.failed);
       // A cancelled TCP connect fails with a SocketException.
       if (cancelled && error is! SocksCancelledException) {
         throw _reconnectCancelled();
@@ -1035,34 +764,21 @@ class SOCKSSocket {
     Function? onError,
     void Function()? onDone,
     bool? cancelOnError,
-  }) {
-    return sslEnabled
-        ? _secureResponseController.stream.listen(
-            onData,
-            onError: onError,
-            onDone: onDone,
-            cancelOnError: cancelOnError,
-          )
-        : _responseController.stream.listen(
-            onData,
-            onError: onError,
-            onDone: onDone,
-            cancelOnError: cancelOnError,
-          );
-  }
+  }) =>
+      _input.stream.listen(
+        onData,
+        onError: onError,
+        onDone: onDone,
+        cancelOnError: cancelOnError,
+      );
 
   /// Sends the server.features command to the proxy server.
   ///
   /// This demos how to send the server.features command.  Use as an example
   /// for sending other commands.
-  ///
-  /// Returns:
-  ///   A Future that resolves to void.
   Future<void> sendServerFeaturesCommand() async {
-    // The server.features command.
     const String command =
         '{"jsonrpc":"2.0","id":"0","method":"server.features","params":[]}';
-
     await write(command, newline: true);
   }
 }
