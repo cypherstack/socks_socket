@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Add `destroy()` to abort without draining output; writes it cuts short fail instead of reporting success (#2). It also ends a connect, TLS handshake or `reconnect()` in flight, and a later `close()` completes normally even when it failed a close that was already draining.
 - `close()` now ends a `reconnect()` or TLS handshake in flight instead of being overtaken by the reconnect or waiting for the handshake deadline.
 - Fail a handshake read or write at once when the socket reports its error synchronously, as macOS does for a reset peer, instead of waiting for the handshake deadline. `SocksConnection` shares the fix.
 - Document that `reconnect()` works after `cancel()`.

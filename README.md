@@ -93,6 +93,8 @@ await socksSocket.write('{"jsonrpc":"2.0","method":"server.ping","id":1}',
 
 After `cancel()` or `close()` during connect, `reconnect()` opens a new connection once a target is known. `reconnect()` closes the current connection first, which ends `inputStream`; a `close()` or `destroy()` while it is in progress cancels it, including one made from that stream's `onDone`. Peer close is noticed, and `state` updated, only while `inputStream` has a listener.
 
+`destroy()` aborts a connection without draining output; pending writes fail, and a connect, TLS handshake or `reconnect()` in flight ends with `SocksCancelledException`. Use `close()` to drain accepted output before closing; it ends a connect or `reconnect()` in flight the same way.
+
 ## HttpClient Connections
 
 `SocksConnection.start` returns a cancellable `ConnectionTask<Socket>` for `HttpClient.connectionFactory`; see `example/http/http_connection.dart`. Pass `tlsHost` for HTTPS. Requires Dart 3.5.

@@ -132,6 +132,10 @@ class SOCKSSocket {
   late Socket _socksSocket;
 
   /// Getter for the underlying Socket that connects to the SOCKS5 proxy server.
+  ///
+  /// To abort the connection, call [destroy] rather than `socket.destroy()`:
+  /// dart:io completes a pending flush on a destroyed [Socket] normally, so
+  /// writes cut short that way would be reported as sent.
   Socket get socket => sslEnabled ? _secureSocksSocket : _socksSocket;
 
   /// A wrapper around the _socksSocket that enables SSL connections.
@@ -796,7 +800,16 @@ class SOCKSSocket {
       try {
         socket.add(bytes);
         await socket.flush().timeout(_operationTimeout);
+        // A transport destroyed mid-flush can still complete the flush.
+        if (_writeFailure != null) {
+          Error.throwWithStackTrace(_writeFailure!, _writeFailureStack!);
+        }
       } catch (e, stack) {
+        // A failure that already ended the connection, such as destroy(),
+        // is the cause; report it rather than the transport's symptom.
+        if (_writeFailure != null) {
+          Error.throwWithStackTrace(_writeFailure!, _writeFailureStack!);
+        }
         final error = e is SocksException || e is TimeoutException
             ? e
             : SocksConnectionException(message: 'SOCKS5 write failed: $e');
@@ -830,6 +843,27 @@ class SOCKSSocket {
   }
 
   Future<void> _ensureClosed() => _closeFuture ??= _close();
+
+  /// Tears the connection down at once, without draining output.
+  ///
+  /// Writes not yet delivered, through [write] or [outputStream], fail with a
+  /// [SocksConnectionException], and [inputStream] ends. A connect or
+  /// [reconnect] in flight fails with [SocksCancelledException]. A later
+  /// [close] completes normally.
+  void destroy() {
+    _closeRequested = true;
+    _signalCancel(
+      SocksCancelledException(message: 'SOCKS5 connection destroyed.'),
+    );
+    _failWrites(
+      SocksConnectionException(message: 'SOCKS5 connection destroyed'),
+      StackTrace.current,
+    );
+    _state = SocksSocketState.disconnected;
+    // A close already draining fails once its writes do; keep its outcome for
+    // the caller that started it, but let a later close() complete normally.
+    _closeFuture = (_closeFuture ?? _close()).catchError((Object _) {});
+  }
 
   Future<void> _flushBeforeClose(Socket transport) async {
     final elapsed = Stopwatch()..start();
@@ -1080,9 +1114,11 @@ class _SocketOutputSink implements StreamSink<List<int>> {
 
   void _endStream([Object? error, StackTrace? stack]) {
     final completed = _streamDone;
-    _source?.cancel();
+    final source = _source;
     _source = null;
     _streamDone = null;
+    // The source's onCancel may call destroy(), which ends up back here.
+    source?.cancel();
     if (completed == null) return;
     if (error == null) {
       completed.complete();

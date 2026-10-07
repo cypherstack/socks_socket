@@ -8,6 +8,7 @@ import 'helpers/tunnel_peer.dart';
 /// close() and destroy() racing a reconnect, a TLS handshake, or each other.
 void main() {
   final teardowns = <String, Future<void> Function(SOCKSSocket)>{
+    'destroy()': (client) async => client.destroy(),
     'close()': (client) => client.close(),
   };
 
@@ -134,6 +135,18 @@ void main() {
       await peer.firstChunk.future.timeout(tunnelDeadline);
       expect(peer.bytes.takeBytes(), 'again'.codeUnits);
     });
+
+    test('reconnect() after destroy() connects again (TLS=$tls)', () async {
+      final server = await TunnelServer.start(tls: tls);
+      final (client, _) = await server.connect();
+      client.destroy();
+      await client.reconnect().timeout(tunnelDeadline);
+      expect(client.state, SocksSocketState.connected);
+      final peer = await server.nextPeer();
+      await client.write('again');
+      await peer.firstChunk.future.timeout(tunnelDeadline);
+      expect(peer.bytes.takeBytes(), 'again'.codeUnits);
+    });
   }
 
   test('a second reconnect() is rejected while one is in progress', () async {
@@ -166,6 +179,46 @@ void main() {
       expect(client.state, SocksSocketState.disconnected);
       hold.release.complete();
       await client.close().timeout(tunnelDeadline);
+    });
+  }
+
+  for (final tls in [false, true]) {
+    group('close() after destroy() (TLS=$tls)', () {
+      final payload = List.filled(8 * 1024 * 1024, 1);
+
+      test('completes when destroy() failed an explicit close in flight',
+          () async {
+        final (client, peer) = await connectTunnel(tls: tls);
+        peer.input.pause();
+        final uploading = client.outputStream.addStream(Stream.value(payload));
+        final uploadFailed =
+            expectLater(uploading, throwsA(isA<SocksConnectionException>()));
+        await Future<void>.delayed(const Duration(milliseconds: 200));
+        final closing = client.close();
+        final closeFailed =
+            expectLater(closing, throwsA(isA<SocksConnectionException>()));
+        client.destroy();
+        await Future.wait([uploadFailed, closeFailed]).timeout(tunnelDeadline);
+        await client.close().timeout(tunnelDeadline);
+        expect(client.state, SocksSocketState.disconnected);
+      });
+
+      test('completes when destroy() failed a peer-EOF close in flight',
+          () async {
+        final (client, peer) = await connectTunnel(tls: tls);
+        final eof = client.inputStream.drain<void>();
+        peer.input.pause();
+        final uploading = client.outputStream.addStream(Stream.value(payload));
+        final uploadFailed =
+            expectLater(uploading, throwsA(isA<SocksConnectionException>()));
+        await Future<void>.delayed(const Duration(milliseconds: 200));
+        await peer.socket.close();
+        await eof.timeout(tunnelDeadline);
+        client.destroy();
+        await uploadFailed.timeout(tunnelDeadline);
+        await client.close().timeout(tunnelDeadline);
+        expect(client.state, SocksSocketState.disconnected);
+      });
     });
   }
 }
