@@ -1,7 +1,10 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:socks_socket/socks_socket.dart';
 import 'package:test/test.dart';
+
+import 'helpers/tunnel_peer.dart';
 
 void main() {
   final host = InternetAddress.loopbackIPv4.address;
@@ -32,5 +35,16 @@ void main() {
             proxyPort: 1080,
             operationTimeout: const Duration(seconds: -1)),
         throwsArgumentError);
+  });
+
+  test('a sub-second handshake timeout is reported in milliseconds', () async {
+    final server = await TunnelServer.start();
+    server.holdGreeting = TunnelHold();
+    final client = await server.createClient(
+        handshakeTimeout: const Duration(milliseconds: 500));
+    await expectLater(
+        client.connect(),
+        throwsA(isA<TimeoutException>()
+            .having((e) => e.message, 'message', contains('500 ms'))));
   });
 }

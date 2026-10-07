@@ -450,14 +450,19 @@ class SOCKSSocket {
     if (!_input.hasListener) _subscription!.pause();
   }
 
+  static String _describe(Duration duration) =>
+      duration.inMilliseconds % 1000 == 0
+          ? '${duration.inSeconds} s'
+          : '${duration.inMilliseconds} ms';
+
   /// Runs one handshake [step] against the handshake deadline and the cancel
   /// signal. A cancellation that lands as the step completes still wins.
   Future<T> _handshake<T>(Future<T> Function() step) async {
     final cancel = _cancel!;
     final result = await Future.any<T>([step(), cancel.future]).timeout(
       _handshakeTimeout,
-      onTimeout: () => throw TimeoutException('SOCKS5 handshake timed out '
-          'after ${_handshakeTimeout.inSeconds} seconds.'),
+      onTimeout: () => throw TimeoutException(
+          'SOCKS5 handshake timed out after ${_describe(_handshakeTimeout)}.'),
     );
     if (cancel.isCompleted) await cancel.future;
     return result;
