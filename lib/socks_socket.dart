@@ -234,22 +234,6 @@ class SOCKSSocket {
     return instance;
   }
 
-  /// Deprecated. Does not await the proxy connection; use [SOCKSSocket.create].
-  @Deprecated('Use SOCKSSocket.create() instead')
-  SOCKSSocket({
-    required this.proxyHost,
-    required this.proxyPort,
-    required this.sslEnabled,
-  })  : _isolationToken = null,
-        _handshakeTimeout = const Duration(seconds: 30),
-        _operationTimeout = const Duration(seconds: 30),
-        _allowBadCertificates = false,
-        _securityContext = null,
-        _requireIsolation = null,
-        _closeOnPeerEof = true {
-    _init();
-  }
-
   static void _checkIsolationToken(String? token) {
     if (token != null) encodeSocksCredentials(token, token);
   }
@@ -358,12 +342,8 @@ class SOCKSSocket {
       throw StateError(
           'Cannot connect: use reconnect() for another connection');
     }
-    final channel = _channel;
-    if (channel == null) {
-      // The deprecated constructor does not await the proxy connection.
-      throw StateError('Cannot connect: the proxy connection is not open yet');
-    }
     _phase = _Phase.greeting;
+    final channel = _channel!;
     try {
       await _handshake(() => negotiateSocks(
             write: channel.write,
