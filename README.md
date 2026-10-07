@@ -99,7 +99,7 @@ By default the connection closes once the peer closes its side. Pass `closeOnPee
 
 ## Migrating to 2.0.0
 
-`SOCKSSocket.socket` has been removed. All transport operations now go through the wrapper so writes and teardown share the same lifecycle tracking.
+`SOCKSSocket.socket`, `responseController` and `subscription` have been removed. All transport operations now go through the wrapper so writes and teardown share the same lifecycle tracking.
 
 | Previous operation | Replacement |
 | --- | --- |
@@ -108,6 +108,7 @@ By default the connection closes once the peer closes its side. Pass `closeOnPee
 | `socks.socket.add(bytes)` | `socks.outputStream.add(bytes)` |
 | `socks.socket.addStream(source)` | `await socks.outputStream.addStream(source)` |
 | Reading the underlying socket | `socks.inputStream` or `socks.listen(...)` |
+| `socks.responseController`, `socks.subscription` | `socks.inputStream`; pause or cancel your own subscription to it |
 | `SecureSocket.secure(socks.socket, ...)` | Set `sslEnabled: true` and, if needed, `securityContext` on `SOCKSSocket.create(...)` |
 
 For an awaited binary write, use `await socks.outputStream.addStream(Stream.value(bytes))`. The output sink accepts one stream at a time. For text, use `await socks.write(text)`. To drain and finish the connection, use `await socks.close()`.

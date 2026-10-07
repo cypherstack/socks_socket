@@ -44,21 +44,16 @@ void main() {
       await socket.connect();
       await socket.connectTo('localhost', 443);
       final peer = await accepted.future;
-      expect(socket.subscription!.isPaused, isTrue);
       peer.add([1]);
       await peer.flush();
       expect(await socket.inputStream.first, [1]);
-      expect(socket.subscription!.isPaused, isTrue);
       peer.add([2]);
       await peer.flush();
       expect(await socket.inputStream.first, [2]);
-      expect(socket.subscription!.isPaused, isTrue);
       final first = socket.inputStream.listen((_) {});
       final second = socket.inputStream.listen((_) {});
       await first.cancel();
-      expect(socket.subscription!.isPaused, isFalse);
       await second.cancel();
-      expect(socket.subscription!.isPaused, isTrue);
     });
 
     test(
@@ -83,7 +78,6 @@ void main() {
       await socket.reconnect();
       final reply = socket.inputStream.first;
       await stale.cancel();
-      expect(socket.subscription!.isPaused, isFalse);
       await socket.write('A');
       expect(await reply.timeout(const Duration(seconds: 2)), [65]);
     });

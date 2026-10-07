@@ -273,12 +273,6 @@ class SOCKSSocket {
   /// Reads pause while there is no listener; earlier data is kept.
   Stream<List<int>> get inputStream => _input.stream;
 
-  /// The controller behind [inputStream].
-  StreamController<List<int>> get responseController => _input;
-
-  /// The subscription that feeds [inputStream], once connected.
-  StreamSubscription<List<int>>? get subscription => _subscription;
-
   StreamSink<List<int>> get outputStream => _outputSink ??= _newOutputSink();
 
   StreamController<List<int>> _newInput() {
