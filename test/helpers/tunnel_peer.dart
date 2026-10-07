@@ -184,6 +184,7 @@ class TunnelServer {
   Future<SOCKSSocket> createClient({
     Duration handshakeTimeout = const Duration(seconds: 30),
     Duration operationTimeout = tunnelDeadline,
+    bool closeOnPeerEof = true,
   }) async {
     final client = await SOCKSSocket.create(
       proxyHost: InternetAddress.loopbackIPv4.address,
@@ -192,6 +193,7 @@ class TunnelServer {
       securityContext: certificates?.clientContext(),
       handshakeTimeout: handshakeTimeout,
       operationTimeout: operationTimeout,
+      closeOnPeerEof: closeOnPeerEof,
     );
     addTearDown(() => client.close().catchError((_) {}));
     return client;
@@ -201,10 +203,12 @@ class TunnelServer {
   Future<(SOCKSSocket, TunnelPeer)> connect({
     Duration handshakeTimeout = const Duration(seconds: 30),
     Duration operationTimeout = tunnelDeadline,
+    bool closeOnPeerEof = true,
   }) async {
     final client = await createClient(
       handshakeTimeout: handshakeTimeout,
       operationTimeout: operationTimeout,
+      closeOnPeerEof: closeOnPeerEof,
     );
     await client.connect();
     await client.connectTo('localhost', 443);
@@ -230,9 +234,11 @@ class TunnelServer {
 Future<(SOCKSSocket, TunnelPeer)> connectTunnel({
   bool tls = false,
   Duration operationTimeout = tunnelDeadline,
+  bool closeOnPeerEof = true,
 }) async {
   final server = await TunnelServer.start(tls: tls);
   return server.connect(
     operationTimeout: operationTimeout,
+    closeOnPeerEof: closeOnPeerEof,
   );
 }

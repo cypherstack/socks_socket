@@ -226,7 +226,8 @@ class SOCKSSocket {
   SocksSocketState _state = SocksSocketState.disconnected;
 
   /// Peer close or failure is noticed only while [inputStream] has a listener;
-  /// until then a [write] to a dead peer may appear to succeed.
+  /// until then a [write] to a dead peer may appear to succeed. With
+  /// `closeOnPeerEof: false`, peer close leaves the state unchanged.
   SocksSocketState get state => _state;
 
   /// Target domain for [reconnect].
@@ -276,6 +277,8 @@ class SOCKSSocket {
 
   final bool? _requireIsolation;
 
+  final bool _closeOnPeerEof;
+
   /// Private constructor.
   SOCKSSocket._(
       this.proxyHost,
@@ -286,7 +289,8 @@ class SOCKSSocket {
       this._operationTimeout,
       this._allowBadCertificates,
       this._securityContext,
-      this._requireIsolation);
+      this._requireIsolation,
+      this._closeOnPeerEof);
 
   /// Provides a stream of data as List<int>.
   ///
@@ -319,6 +323,10 @@ class SOCKSSocket {
   }
 
   /// Creates a SOCKS5 socket to the specified [proxyHost] and [proxyPort].
+  ///
+  /// By default the connection closes once the peer closes its side. With
+  /// [closeOnPeerEof] false, peer EOF only ends [inputStream]: the socket stays
+  /// [SocksSocketState.connected] and keeps writing until [close].
   static Future<SOCKSSocket> create({
     required String proxyHost,
     required int proxyPort,
@@ -329,6 +337,7 @@ class SOCKSSocket {
     bool allowBadCertificates = false,
     SecurityContext? securityContext,
     bool? requireIsolation,
+    bool closeOnPeerEof = true,
   }) async {
     _checkIsolationToken(isolationToken);
     if (requireIsolation == true && isolationToken == null) {
@@ -348,7 +357,8 @@ class SOCKSSocket {
         operationTimeout,
         allowBadCertificates,
         securityContext,
-        requireIsolation);
+        requireIsolation,
+        closeOnPeerEof);
 
     // Initialize the SOCKS socket.
     await instance._init();
@@ -368,7 +378,8 @@ class SOCKSSocket {
         _operationTimeout = const Duration(seconds: 30),
         _allowBadCertificates = false,
         _securityContext = null,
-        _requireIsolation = null {
+        _requireIsolation = null,
+        _closeOnPeerEof = true {
     _init();
   }
 
@@ -451,6 +462,7 @@ class SOCKSSocket {
   /// The peer stopped sending; writes already accepted are still delivered.
   void _peerClosed() {
     _peerReadClosed = true;
+    if (!_closeOnPeerEof) return;
     _state = SocksSocketState.disconnected;
     _ensureClosed().ignore();
   }

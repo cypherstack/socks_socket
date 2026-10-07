@@ -82,6 +82,25 @@ void main() {
       await peer.done.future.timeout(_deadline);
       expect(peer.bytes.takeBytes(), [65, 66]);
     });
+    test('closeOnPeerEof: false keeps writes open after peer EOF (TLS=$tls)',
+        () async {
+      final (client, peer) =
+          await connectTunnel(tls: tls, closeOnPeerEof: false);
+      final eof = client.inputStream.drain<void>();
+      await peer.socket.close();
+      await eof.timeout(_deadline);
+
+      expect(client.state, ConnectionState.connected);
+      await client.write('A').timeout(_deadline);
+      await client.outputStream
+          .addStream(Stream.value([66]))
+          .timeout(_deadline);
+      client.outputStream.add([67]);
+      await client.close().timeout(_deadline);
+      await peer.done.future.timeout(_deadline);
+      expect(peer.bytes.takeBytes(), [65, 66, 67]);
+      expect(client.state, ConnectionState.disconnected);
+    });
   }
 
   test('an output sink first used after peer EOF rejects new uploads',
