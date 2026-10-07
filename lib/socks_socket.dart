@@ -245,6 +245,10 @@ class SOCKSSocket {
   StackTrace? _writeFailureStack;
   Future<void>? _closeFuture;
   bool _closing = false;
+
+  /// Set by [close] and [destroy]; a [reconnect] in flight stops at its next
+  /// step instead of opening a connection the caller has already given up.
+  bool _closeRequested = false;
   bool _peerReadClosed = false;
 
   /// Accept bad certificates (testing only).
@@ -254,6 +258,9 @@ class SOCKSSocket {
 
   /// Cancel signal for in-flight operations.
   Completer<Never>? _cancelCompleter;
+
+  /// The proxy TCP connect in flight, so [close] and [destroy] can end it.
+  ConnectionTask<Object>? _connectTask;
   bool _cancelled = false;
   bool _greetingStarted = false;
   bool _greetingComplete = false;
@@ -376,20 +383,12 @@ class SOCKSSocket {
     _requestStarted = false;
     _peerReadClosed = false;
     if (sslEnabled) {
-      final raw = await RawSocket.connect(
-        proxyHost,
-        proxyPort,
-        timeout: _handshakeTimeout,
-      );
+      final raw = await _connectProxy(RawSocket.startConnect);
       _channel = RawChannel(raw);
       _socksSocket = _channel!.socket();
     } else {
       // Keep a native Socket so callers can use SecureSocket.secure(socket).
-      _socksSocket = await Socket.connect(
-        proxyHost,
-        proxyPort,
-        timeout: _handshakeTimeout,
-      );
+      _socksSocket = await _connectProxy(Socket.startConnect);
       _nativeSocketOpen = true;
       _nativeSocketNeedsDestroy = true;
       _socksSocket.done.then<void>((_) {
@@ -428,11 +427,28 @@ class SOCKSSocket {
     );
   }
 
+  Future<T> _connectProxy<T extends Object>(
+      Future<ConnectionTask<T>> Function(String host, int port) start) async {
+    final task = _connectTask = await start(proxyHost, proxyPort);
+    // A close() or destroy() while the task was being created found
+    // nothing to cancel yet.
+    if (_closeRequested) task.cancel();
+    try {
+      return await task.socket.timeout(_handshakeTimeout, onTimeout: () {
+        task.cancel();
+        throw SocketException(
+            'Connection timed out, host: $proxyHost, port: $proxyPort');
+      });
+    } finally {
+      _connectTask = null;
+    }
+  }
+
   /// The peer stopped sending; writes already accepted are still delivered.
   void _peerClosed() {
     _peerReadClosed = true;
     _state = SocksSocketState.disconnected;
-    close().ignore();
+    _ensureClosed().ignore();
   }
 
   void _destroyTransport() {
@@ -808,7 +824,12 @@ class SOCKSSocket {
   ///
   /// Returns:
   ///  A Future that resolves to void.
-  Future<void> close() => _closeFuture ??= _close();
+  Future<void> close() {
+    _closeRequested = true;
+    return _ensureClosed();
+  }
+
+  Future<void> _ensureClosed() => _closeFuture ??= _close();
 
   Future<void> _flushBeforeClose(Socket transport) async {
     final elapsed = Stopwatch()..start();
@@ -836,8 +857,17 @@ class SOCKSSocket {
     }
   }
 
+  /// Ends a connect in flight. The TLS handshake cannot notice a destroyed
+  /// transport on its own, so it waits for this or for its deadline.
+  void _signalCancel(SocksCancelledException error) {
+    _connectTask?.cancel();
+    final cancel = _cancelCompleter;
+    if (cancel != null && !cancel.isCompleted) cancel.completeError(error);
+  }
+
   Future<void> _close() async {
     _closing = true;
+    _signalCancel(_closedBeforeConnected());
     final upgraded = sslEnabled && _sslUpgraded;
     final channel = upgraded ? _secureChannel : _channel;
     var flushed = false;
@@ -875,7 +905,8 @@ class SOCKSSocket {
   }
 
   /// Cancels an in-flight connect operation. No-op if not connecting.
-  /// The instance cannot be reused afterwards; create a new socket.
+  /// Once a target is known, [reconnect] opens a new connection; to end a
+  /// reconnect in progress, use [close] or [destroy].
   Future<void> cancel() async {
     if (_state != SocksSocketState.connecting) return;
 
@@ -911,6 +942,10 @@ class SOCKSSocket {
 
   /// Reconnects to the previously connected target.
   ///
+  /// Closes the current connection first, which ends [inputStream]. A [close]
+  /// or [destroy] while the reconnect is in progress cancels it with
+  /// [SocksCancelledException], including one made from that stream's onDone.
+  ///
   /// Throws [StateError] if [connectTo] was never called.
   Future<void> reconnect({String? isolationToken}) async {
     if (_reconnecting) throw StateError('Reconnect is already in progress');
@@ -933,11 +968,13 @@ class SOCKSSocket {
       _isolationToken = isolationToken;
     }
 
+    _closeRequested = false;
     try {
-      await close();
+      await _ensureClosed();
     } catch (_) {
       // Connection may already be broken.
     }
+    _checkReconnectAborted();
 
     // Broadcast controllers can't be reused after close.
     _pendingApplicationData = null;
@@ -952,16 +989,30 @@ class SOCKSSocket {
 
     try {
       await _init();
+      _checkReconnectAborted();
       await _connect();
+      _checkReconnectAborted();
       await _connectTo(_targetDomain!, _targetPort!);
+      _checkReconnectAborted();
     } catch (error) {
-      _state = error is SocksCancelledException
-          ? SocksSocketState.disconnected
-          : SocksSocketState.error;
+      final cancelled = error is SocksCancelledException || _closeRequested;
+      _state =
+          cancelled ? SocksSocketState.disconnected : SocksSocketState.error;
       _abandonConnection();
+      // A cancelled TCP connect fails with a SocketException.
+      if (cancelled && error is! SocksCancelledException) {
+        throw _reconnectCancelled();
+      }
       rethrow;
     }
   }
+
+  void _checkReconnectAborted() {
+    if (_closeRequested) throw _reconnectCancelled();
+  }
+
+  SocksCancelledException _reconnectCancelled() => SocksCancelledException(
+      message: 'SOCKS5 reconnect cancelled: the connection was closed.');
 
   StreamSubscription<List<int>> listen(
     void Function(List<int> data)? onData, {

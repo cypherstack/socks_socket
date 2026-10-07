@@ -91,7 +91,7 @@ await socksSocket.write('{"jsonrpc":"2.0","method":"server.ping","id":1}',
     newline: true);
 ```
 
-`cancel()` or `close()` during connect spends the instance; create a new one. Peer close is noticed, and `state` updated, only while `inputStream` has a listener.
+After `cancel()` or `close()` during connect, `reconnect()` opens a new connection once a target is known. `reconnect()` closes the current connection first, which ends `inputStream`; a `close()` or `destroy()` while it is in progress cancels it, including one made from that stream's `onDone`. Peer close is noticed, and `state` updated, only while `inputStream` has a listener.
 
 ## HttpClient Connections
 
