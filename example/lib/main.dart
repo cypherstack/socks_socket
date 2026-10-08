@@ -180,7 +180,12 @@ class _MyAppState extends State<Home> {
                             'bitcoin.stackwallet.com', 50002);
 
                         // Send a server features command to the connected socket, see method for more specific usage example..
+                        final response = socksSocket.inputStream
+                            .transform(utf8.decoder)
+                            .transform(const LineSplitter())
+                            .first;
                         await socksSocket.sendServerFeaturesCommand();
+                        print(await response);
 
                         // You should see a server response printed to the console.
                         //
