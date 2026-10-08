@@ -6,6 +6,7 @@
 - **Breaking:** Remove `responseController` and `subscription`, which exposed the stream controller and subscription behind `inputStream`; closing or cancelling them bypassed the lifecycle tracking. Use `inputStream`.
 - Add `destroy()` to abort without draining output; writes it cuts short fail instead of reporting success (#2). It also ends a connect, TLS handshake or `reconnect()` in flight, and a later `close()` completes normally even when it failed a close that was already draining.
 - Add `closeOnPeerEof` to `create()`; pass `false` to keep writing after the peer half-closes (#3).
+- `closeOutput()` rejects new writes as soon as draining starts, preserves accepted uploads, and aborts the connection and pending output if draining fails or times out.
 - `close()` now ends a `reconnect()` or TLS handshake in flight instead of being overtaken by the reconnect or waiting for the handshake deadline.
 - Give the greeting and username/password authentication exchanges separate handshake timeout budgets, preserving the previous slow-proxy behavior.
 - Roll back `outputStream.addStream()` bookkeeping if the supplied stream rejects its subscription, so later output shutdown cannot wait forever.

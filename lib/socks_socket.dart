@@ -89,6 +89,9 @@ enum _Phase {
   requesting,
   connected,
 
+  /// [SOCKSSocket.closeOutput] is draining accepted output; input stays open.
+  closingOutput,
+
   /// Output is shut down, but [SOCKSSocket.inputStream] may still receive.
   receiving,
 
@@ -267,7 +270,10 @@ class SOCKSSocket {
         _Phase.greeted ||
         _Phase.requesting =>
           SocksSocketState.connecting,
-        _Phase.connected || _Phase.receiving => SocksSocketState.connected,
+        _Phase.connected ||
+        _Phase.closingOutput ||
+        _Phase.receiving =>
+          SocksSocketState.connected,
         _Phase.failed => SocksSocketState.error,
       };
 
@@ -309,7 +315,8 @@ class SOCKSSocket {
     });
     if (_writeFailure != null) {
       sink._stop(_writeFailure!, _writeFailureStack!);
-    } else if (_phase == _Phase.receiving ||
+    } else if (_phase == _Phase.closingOutput ||
+        _phase == _Phase.receiving ||
         _phase == _Phase.closing ||
         _phase == _Phase.closed) {
       sink.close().ignore();
@@ -422,12 +429,16 @@ class SOCKSSocket {
             ? e
             : SocksConnectionException(message: 'SOCKS5 connection error: $e');
         if (!_input.isClosed) _input.addError(error);
-        if (_phase == _Phase.connected || _phase == _Phase.receiving) {
+        if (_phase == _Phase.connected ||
+            _phase == _Phase.closingOutput ||
+            _phase == _Phase.receiving) {
           _fail(error, stack, _Phase.failed);
         }
       },
       onDone: () {
-        if ((_phase == _Phase.connected || _phase == _Phase.receiving) &&
+        if ((_phase == _Phase.connected ||
+                _phase == _Phase.closingOutput ||
+                _phase == _Phase.receiving) &&
             _closeOnPeerEof) {
           _ensureClosed().ignore();
         }
@@ -529,10 +540,10 @@ class SOCKSSocket {
     await _queueWrite(newline ? [...data, 0x0A] : data);
   }
 
-  /// close() rejects new sink operations, but an addStream it accepted still
-  /// feeds chunks while output drains.
-  Future<void> _queueSinkWrite(List<int> data) =>
-      _queueWrite(data, draining: _phase == _Phase.closing);
+  /// close() and closeOutput() reject new sink operations, but an addStream
+  /// they accepted still feeds chunks while output drains.
+  Future<void> _queueSinkWrite(List<int> data) => _queueWrite(data,
+      draining: _phase == _Phase.closing || _phase == _Phase.closingOutput);
 
   /// Throws synchronously when not writable, so a bound stream ends with the
   /// [StateError] instead of failing the connection.
@@ -589,11 +600,14 @@ class SOCKSSocket {
 
   /// Drains accepted output and shuts down only the sending direction.
   ///
+  /// Rejects new writes immediately while an already accepted upload drains.
   /// [inputStream] remains open so a peer that waits for request EOF before
   /// replying can still deliver its response. Call [close] after consuming
   /// that response to release the remaining connection resources.
+  /// A drain timeout or transport failure aborts the connection and fails
+  /// pending output; [close] also reports that failure.
   Future<void> closeOutput() {
-    if (_phase == _Phase.receiving) {
+    if (_phase == _Phase.closingOutput || _phase == _Phase.receiving) {
       return _closeOutputFuture ?? Future<void>.value();
     }
     if (_phase != _Phase.connected) {
@@ -604,13 +618,21 @@ class SOCKSSocket {
   }
 
   Future<void> _closeOutput() async {
+    _phase = _Phase.closingOutput;
     final transport = _transport!;
-    await _outputSink?.close().timeout(_operationTimeout);
-    await _writeTail;
-    _throwWriteFailure();
-    await transport.flush().timeout(_operationTimeout);
-    await transport.close();
-    if (_phase == _Phase.connected) _phase = _Phase.receiving;
+    try {
+      await _outputSink?.close().timeout(_operationTimeout);
+      await _writeTail;
+      _throwWriteFailure();
+      await transport.flush().timeout(_operationTimeout);
+      await transport.close();
+      if (_phase == _Phase.closingOutput) _phase = _Phase.receiving;
+    } catch (error, stack) {
+      // Preserve a failure already recorded by a write or destroy().
+      _throwWriteFailure();
+      _fail(error, stack, _Phase.failed);
+      rethrow;
+    }
   }
 
   /// Tears the connection down at once, without draining output.
@@ -674,7 +696,10 @@ class SOCKSSocket {
   Future<void> _close() async {
     _signalCancel(_closedBeforeConnected());
     _phase = switch (_phase) {
-      _Phase.connected || _Phase.receiving => _Phase.closing,
+      _Phase.connected ||
+      _Phase.closingOutput ||
+      _Phase.receiving =>
+        _Phase.closing,
       _Phase.failed => _Phase.failed,
       _ => _Phase.closed,
     };

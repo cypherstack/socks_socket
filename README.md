@@ -111,7 +111,7 @@ By default the connection closes once the peer closes its side. Pass `closeOnPee
 | `socks.responseController`, `socks.subscription` | `socks.inputStream`; pause or cancel your own subscription to it |
 | `SecureSocket.secure(socks.socket, ...)` | Set `sslEnabled: true` and, if needed, `securityContext` on `SOCKSSocket.create(...)` |
 
-For an awaited binary write, use `await socks.outputStream.addStream(Stream.value(bytes))`. The output sink accepts one stream at a time. For text, use `await socks.write(text)`. To signal request EOF while continuing to receive, use `await socks.closeOutput()`. To drain and finish the entire connection, use `await socks.close()`.
+For an awaited binary write, use `await socks.outputStream.addStream(Stream.value(bytes))`. The output sink accepts one stream at a time. For text, use `await socks.write(text)`. To signal request EOF while continuing to receive, use `await socks.closeOutput()`. It immediately rejects new writes while draining accepted output; a drain timeout or transport failure aborts the connection and fails pending output. To drain and finish the entire connection, use `await socks.close()`.
 
 Built-in TLS starts during `connectTo()`, after the SOCKS handshake. Upgrading an established plaintext application session to TLS is not exposed by `SOCKSSocket`.
 
