@@ -2,7 +2,7 @@
 //
 // See the [Arti package](https://pub.dev/packages/arti) for a pure Dart implementation.
 
-import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:socks_socket/socks_socket.dart';
@@ -25,6 +25,11 @@ Future<void> main() async {
 
   // Send a server features command to the connected socket, see method for
   // more specific usage example..
+  final response = socksSocket.inputStream
+      .transform(utf8.decoder)
+      .transform(const LineSplitter())
+      .first;
   await socksSocket.sendServerFeaturesCommand();
+  print(await response);
   await socksSocket.close();
 }

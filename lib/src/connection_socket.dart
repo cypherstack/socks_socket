@@ -3,6 +3,61 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+abstract interface class RawSocketConnectTask {
+  Future<RawSocket> get socket;
+  void cancel();
+}
+
+final class _IoRawSocketConnectTask implements RawSocketConnectTask {
+  final ConnectionTask<RawSocket> _task;
+  _IoRawSocketConnectTask(this._task);
+
+  @override
+  Future<RawSocket> get socket => _task.socket;
+
+  @override
+  void cancel() => _task.cancel();
+}
+
+typedef RawSocketStarter = Future<RawSocketConnectTask> Function(
+    String host, int port);
+
+Future<RawSocketConnectTask> _startRawSocket(String host, int port) async =>
+    _IoRawSocketConnectTask(await RawSocket.startConnect(host, port));
+
+/// One cancellable attempt to open a raw socket.
+///
+/// Cancellation is sticky, including while [RawSocket.startConnect] is still
+/// creating its [ConnectionTask]. This class is public only within `src/` so
+/// the timing-sensitive behavior can be tested without relying on a host's TCP
+/// listen-backlog behavior.
+class CancellableRawSocketConnect {
+  final RawSocketStarter _start;
+  RawSocketConnectTask? _task;
+  bool _cancelled = false;
+
+  CancellableRawSocketConnect([RawSocketStarter start = _startRawSocket])
+      : _start = start;
+
+  Future<RawSocket> connect(String host, int port, Duration timeout) async {
+    final task = _task = await _start(host, port);
+    if (_cancelled) task.cancel();
+    try {
+      return await task.socket.timeout(timeout, onTimeout: () {
+        task.cancel();
+        throw SocketException('Connection timed out, host: $host, port: $port');
+      });
+    } finally {
+      _task = null;
+    }
+  }
+
+  void cancel() {
+    _cancelled = true;
+    _task?.cancel();
+  }
+}
+
 class RawChannel {
   final RawSocket raw;
   late final StreamSubscription<RawSocketEvent> _subscription;
@@ -11,6 +66,7 @@ class RawChannel {
   Completer<void>? _writable;
   bool _closed = false;
   bool _readClosed = false;
+  bool _writeClosed = false;
   bool _detached = false;
   bool _streaming = false;
   Object? _error;
@@ -37,11 +93,7 @@ class RawChannel {
         }
       },
       onCancel: () {
-        if (!_readClosed && !_closed && !_detached) {
-          _readClosed = true;
-          raw.readEventsEnabled = false;
-          raw.shutdown(SocketDirection.receive);
-        }
+        _closeRead();
       },
     );
     _subscription = raw.listen(_event, onError: (Object error) {
@@ -70,6 +122,7 @@ class RawChannel {
       _readable?.complete();
       _readable = null;
       if (_streaming && !_incoming.isClosed) _incoming.close();
+      if (_writeClosed) destroy();
     } else if (event == RawSocketEvent.closed) {
       destroy();
     }
@@ -79,14 +132,15 @@ class RawChannel {
     final bytes = Uint8List(count);
     var offset = 0;
     while (offset < count) {
-      if (_closed) {
-        throw _error ?? const SocketException('SOCKS transport closed');
-      }
+      _checkOpen();
       final chunk = raw.read(count - offset);
       if (chunk != null) {
         bytes.setRange(offset, offset + chunk.length, chunk);
         offset += chunk.length;
       } else {
+        // A failed read reports its error, and closes this channel, before
+        // returning; a waiter created now would never be completed.
+        _checkOpen();
         if (_readClosed) {
           throw const SocketException('Incomplete SOCKS response');
         }
@@ -101,19 +155,24 @@ class RawChannel {
   Future<void> write(List<int> bytes) async {
     var offset = 0;
     while (offset < bytes.length) {
-      if (_closed) {
-        throw _error ?? const SocketException('SOCKS transport closed');
-      }
+      _checkOpen();
       offset += raw.write(bytes, offset);
+      // A secure socket reports a failed write synchronously, closing this
+      // channel before write() returns; a plain socket defers the report.
+      _checkOpen();
       // Plain sockets may buffer the send; wait until writable before flushing.
       if (offset < bytes.length || raw is! RawSecureSocket) {
         final ready = _writable = Completer<void>();
         raw.writeEventsEnabled = true;
         await ready.future;
-        if (_closed) {
-          throw _error ?? const SocketException('SOCKS transport closed');
-        }
+        _checkOpen();
       }
+    }
+  }
+
+  void _checkOpen() {
+    if (_closed) {
+      throw _error ?? const SocketException('SOCKS transport closed');
     }
   }
 
@@ -128,6 +187,27 @@ class RawChannel {
     _streaming = true;
     if (_readClosed && !_incoming.isClosed) _incoming.close();
     return raw is RawSecureSocket ? _TlsSocket(this) : _ConnectionSocket(this);
+  }
+
+  void _closeRead() {
+    if (_readClosed || _closed || _detached) return;
+    _readClosed = true;
+    raw.readEventsEnabled = false;
+    try {
+      raw.shutdown(SocketDirection.receive);
+    } finally {
+      if (_writeClosed) destroy();
+    }
+  }
+
+  void _closeWrite() {
+    if (_writeClosed || _closed) return;
+    _writeClosed = true;
+    try {
+      raw.shutdown(SocketDirection.send);
+    } finally {
+      if (_readClosed) destroy();
+    }
   }
 
   void destroy() {
@@ -187,9 +267,7 @@ class _RawConsumer implements StreamConsumer<List<int>> {
   }
 
   @override
-  Future<void> close() async {
-    if (!channel._closed) channel.raw.shutdown(SocketDirection.send);
-  }
+  Future<void> close() async => channel._closeWrite();
 }
 
 class _ConnectionSocket extends StreamView<Uint8List> implements Socket {

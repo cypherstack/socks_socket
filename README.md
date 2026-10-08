@@ -1,7 +1,7 @@
 # SOCKS sockets
 
-    [![Pub](https://img.shields.io/pub/v/socks_socket.svg)](https://pub.dev/packages/socks_socket)
-    [![GitHub](https://img.shields.io/github/license/stackdump/socks_socket)](
+[![Pub](https://img.shields.io/pub/v/socks_socket.svg)](https://pub.dev/packages/socks_socket)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 SOCKS version 5 sockets for Dart and Flutter, *eg.* ElectrumX and/or Fulcrum over Tor via socket(s).
 
@@ -25,12 +25,18 @@ SOCKS version 5 sockets for Dart and Flutter, *eg.* ElectrumX and/or Fulcrum ove
 See `socks_socket.dart` itself for properties and methods and the example for reference.
 
 ```dart
+import 'dart:io';
+
 import 'package:socks_socket/socks.dart';
+
+// The SOCKS5 port of your Tor instance, for example Tor.instance.port when
+// Tor runs in-app through package:tor_ffi_plugin.
+const proxyPort = 9050;
 
 // Instantiate a socks socket at localhost and on the port selected by the tor service.
 var socksSocket = await SOCKSSocket.create(
     proxyHost: InternetAddress.loopbackIPv4.address,
-    proxyPort: Tor.instance.port,
+    proxyPort: proxyPort,
     sslEnabled: true, // For SSL connections.
 );
 
@@ -54,7 +60,7 @@ await socksSocket.sendServerFeaturesCommand();
 // Configure custom timeouts for slow networks like Tor.
 var socksSocket = await SOCKSSocket.create(
     proxyHost: InternetAddress.loopbackIPv4.address,
-    proxyPort: Tor.instance.port,
+    proxyPort: proxyPort,
     sslEnabled: true,
     handshakeTimeout: Duration(seconds: 60),
     operationTimeout: Duration(seconds: 45),
@@ -67,7 +73,7 @@ var socksSocket = await SOCKSSocket.create(
 // Use isolationToken to request a separate Tor circuit.
 var socksSocket = await SOCKSSocket.create(
     proxyHost: InternetAddress.loopbackIPv4.address,
-    proxyPort: Tor.instance.port,
+    proxyPort: proxyPort,
     sslEnabled: true,
     isolationToken: 'wallet-btc-001',
 );
@@ -91,7 +97,31 @@ await socksSocket.write('{"jsonrpc":"2.0","method":"server.ping","id":1}',
     newline: true);
 ```
 
-`cancel()` or `close()` during connect spends the instance; create a new one. Peer close is noticed, and `state` updated, only while `inputStream` has a listener.
+If `connect()` fails, the instance is spent: `state` is `error`, another `connect()` throws, and `reconnect()` has no target. Create a new instance. After a failed `connectTo()`, `reconnect()` retries that target. After `cancel()` or `close()` during connect, `reconnect()` opens a new connection once a target is known. `reconnect()` closes the current connection first, which ends `inputStream`; a `close()` or `destroy()` while it is in progress cancels it, including one made from that stream's `onDone`. Peer close is noticed, and `state` updated, only while `inputStream` has a listener.
+
+By default the connection closes once the peer closes its side. Pass `closeOnPeerEof: false` to `create()` to keep writing after a peer half-close until you call `close()`.
+
+`destroy()` aborts a connection without draining output; pending writes fail, and a connect, TLS handshake or `reconnect()` in flight ends with `SocksCancelledException`. Use `close()` to drain accepted output before closing; it ends a connect or `reconnect()` in flight the same way. When a protocol requires request EOF before the response, use `closeOutput()`, consume the response from `inputStream`, then call `close()`.
+
+## Migrating to 2.0.0
+
+`SOCKSSocket.socket`, `responseController` and `subscription` have been removed. All transport operations now go through the wrapper so writes and teardown share the same lifecycle tracking.
+
+| Previous operation | Replacement |
+| --- | --- |
+| `socks.socket.destroy()` | `socks.destroy()` |
+| `socks.socket.close()` | `await socks.closeOutput()` to preserve input (the native half-close behavior), or `await socks.close()` to close both directions |
+| `socks.socket.add(bytes)` | `socks.outputStream.add(bytes)` |
+| `socks.socket.addStream(source)` | `await socks.outputStream.addStream(source)` |
+| Reading the underlying socket | `socks.inputStream` or `socks.listen(...)` |
+| `socks.responseController`, `socks.subscription` | `socks.inputStream`; pause or cancel your own subscription to it |
+| `SecureSocket.secure(socks.socket, ...)` | Set `sslEnabled: true` and, if needed, `securityContext` on `SOCKSSocket.create(...)` |
+
+For an awaited binary write, use `await socks.outputStream.addStream(Stream.value(bytes))`. The output sink accepts one stream at a time. For text, use `await socks.write(text)`. To signal request EOF while continuing to receive, use `await socks.closeOutput()`. It immediately rejects new writes while draining accepted output; a drain timeout or transport failure aborts the connection and fails pending output. To drain and finish the entire connection, use `await socks.close()`.
+
+Built-in TLS starts during `connectTo()`, after the SOCKS handshake. Upgrading an established plaintext application session to TLS is not exposed by `SOCKSSocket`.
+
+`SocksConnection.start` still returns a `ConnectionTask<Socket>` for `HttpClient.connectionFactory`; that separate API is unchanged.
 
 ## HttpClient Connections
 

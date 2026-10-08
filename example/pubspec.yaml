@@ -34,12 +34,9 @@ dependencies:
   socks_socket:
     path: ..
   tor_ffi_plugin:
-    # When depending on this package from a real application you should use:
-    #   tor_ffi_plugin: ^x.y.z
-    # See https://dart.dev/tools/pub/dependencies#version-constraints
-    # The example app is bundled with the plugin so we use a path dependency on
-    # the parent directory to use the current plugin's version.
-    git: https://github.com/cypherstack/tor # TODO: rework example app to use user-provided Tor proxy.
+    git:
+      url: https://github.com/cypherstack/tor
+      ref: 5586bfa3c48e495bc00f9b56fa18869daf768573 # native-0.1.0
 
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.

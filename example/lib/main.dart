@@ -5,7 +5,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:socks_socket/socks_socket.dart';
+import 'package:socks_socket/socks.dart';
 // Imports needed for tor usage:
 import 'package:socks5_proxy/socks_client.dart'; // Just for example; can use any socks5 proxy package, pick your favorite.
 import 'package:tor_ffi_plugin/tor_ffi_plugin.dart';
@@ -180,7 +180,12 @@ class _MyAppState extends State<Home> {
                             'bitcoin.stackwallet.com', 50002);
 
                         // Send a server features command to the connected socket, see method for more specific usage example..
+                        final response = socksSocket.inputStream
+                            .transform(utf8.decoder)
+                            .transform(const LineSplitter())
+                            .first;
                         await socksSocket.sendServerFeaturesCommand();
+                        print(await response);
 
                         // You should see a server response printed to the console.
                         //
