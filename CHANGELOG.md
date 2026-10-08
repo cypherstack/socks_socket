@@ -1,7 +1,3 @@
-## Unreleased
-
-- The handshake timeout message reports sub-second deadlines in milliseconds instead of "0 seconds".
-
 ## 2.0.0
 
 - **Breaking:** Remove `SOCKSSocket.socket` so transport operations cannot bypass the wrapper's write queue and lifecycle tracking. Use `destroy()`, `closeOutput()`, `close()`, `write()`, `outputStream`, and `inputStream` instead. `closeOutput()` preserves the native socket's write-side half-close behavior.
@@ -9,18 +5,23 @@
 - **Breaking:** Remove the `SOCKSSocket()` constructor, deprecated since 1.2.0; it never awaited the proxy connection. Use `SOCKSSocket.create()`.
 - **Breaking:** Remove `responseController` and `subscription`, which exposed the stream controller and subscription behind `inputStream`; closing or cancelling them bypassed the lifecycle tracking. Use `inputStream`.
 - Add `destroy()` to abort without draining output; writes it cuts short fail instead of reporting success (#2). It also ends a connect, TLS handshake or `reconnect()` in flight, and a later `close()` completes normally even when it failed a close that was already draining.
+- Add `closeOutput()` to drain and half-close the sending direction while preserving input for protocols that respond after request EOF.
 - Add `closeOnPeerEof` to `create()`; pass `false` to keep writing after the peer half-closes (#3).
 - `closeOutput()` rejects new writes as soon as draining starts, preserves accepted uploads, and aborts the connection and pending output if draining fails or times out.
 - `close()` now ends a `reconnect()` or TLS handshake in flight instead of being overtaken by the reconnect or waiting for the handshake deadline.
 - Give the greeting and username/password authentication exchanges separate handshake timeout budgets, preserving the previous slow-proxy behavior.
 - Roll back `outputStream.addStream()` bookkeeping if the supplied stream rejects its subscription, so later output shutdown cannot wait forever.
 - Make `close()` consistently rethrow a recorded write failure whether it came from `write()` or `outputStream`.
+- Make `closeOutput()` rethrow the same recorded write failure as `close()` instead of replacing it with a state error.
+- Release the underlying socket after callers close both input and output, while still allowing writes between input cancellation and output shutdown.
 - Validate `SOCKSSocket.create()` proxy and timeout arguments before connecting.
+- The handshake timeout message reports sub-second deadlines in milliseconds instead of "0 seconds".
 - Fail a handshake read or write at once when the socket reports its error synchronously, as macOS does for a reset peer, instead of waiting for the handshake deadline. `SocksConnection` shares the fix.
 - Document that `reconnect()` works after `cancel()`.
 - Drive `SOCKSSocket` from one private lifecycle phase instead of a dozen flags. No API change. `state` now reads `disconnected` as soon as `close()` starts draining, not only once it completes.
 - Carry the plain connection over the same raw channel as TLS and `SocksConnection`, so transport errors read the same on both transports.
 - Read handshake replies straight from the channel, as `SocksConnection` does. A greeting or authentication reply with trailing bytes still fails the handshake, and a stray byte before the CONNECT reply now fails it too instead of being dropped. Handshake failure messages come from the shared protocol code.
+- Migrate the Android example to Flutter's declarative Gradle plugins and grant release builds network access.
 
 ## 1.4.0
 
