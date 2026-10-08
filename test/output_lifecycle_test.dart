@@ -94,6 +94,7 @@ void main() {
         socket.outputStream.addError(error);
         await done;
         expect(socket.state, ConnectionState.error);
+        expect(() => socket.closeOutput(), throwsA(same(error)));
       });
     });
   }

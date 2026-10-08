@@ -612,14 +612,17 @@ class SOCKSSocket {
   /// A drain timeout or transport failure aborts the connection and fails
   /// pending output; [close] also reports that failure.
   Future<void> closeOutput() {
+    final closing = _closeOutputFuture;
+    if (closing != null) return closing;
+    _throwWriteFailure();
     if (_phase == _Phase.closingOutput || _phase == _Phase.receiving) {
-      return _closeOutputFuture ?? Future<void>.value();
+      return Future<void>.value();
     }
     if (_phase != _Phase.connected) {
       throw StateError(
           'Cannot close output: socket is not connected (state: $state)');
     }
-    return _closeOutputFuture ??= _closeOutput();
+    return _closeOutputFuture = _closeOutput();
   }
 
   Future<void> _closeOutput() async {
