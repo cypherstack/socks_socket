@@ -859,6 +859,23 @@ void main() {
       await socket.close();
     });
 
+    test('authentication receives a fresh handshake timeout', () async {
+      server
+        ..requireAuth = true
+        ..responseDelay = const Duration(milliseconds: 150);
+      await server.start();
+
+      final socket = await SOCKSSocket.create(
+        proxyHost: InternetAddress.loopbackIPv4.address,
+        proxyPort: server.port,
+        isolationToken: 'slow-auth',
+        handshakeTimeout: const Duration(milliseconds: 250),
+      );
+      await socket.connect().timeout(const Duration(seconds: 2));
+      expect(socket.state, ConnectionState.connecting);
+      await socket.close();
+    });
+
     test('reconnect with different isolationToken rotates circuit', () async {
       server.requireAuth = true;
       await server.start();

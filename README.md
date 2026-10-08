@@ -91,11 +91,11 @@ await socksSocket.write('{"jsonrpc":"2.0","method":"server.ping","id":1}',
     newline: true);
 ```
 
-After `cancel()` or `close()` during connect, `reconnect()` opens a new connection once a target is known. `reconnect()` closes the current connection first, which ends `inputStream`; a `close()` or `destroy()` while it is in progress cancels it, including one made from that stream's `onDone`. Peer close is noticed, and `state` updated, only while `inputStream` has a listener.
+If `connect()` fails, the instance is spent: `state` is `error`, another `connect()` throws, and `reconnect()` has no target. Create a new instance. After a failed `connectTo()`, `reconnect()` retries that target. After `cancel()` or `close()` during connect, `reconnect()` opens a new connection once a target is known. `reconnect()` closes the current connection first, which ends `inputStream`; a `close()` or `destroy()` while it is in progress cancels it, including one made from that stream's `onDone`. Peer close is noticed, and `state` updated, only while `inputStream` has a listener.
 
 By default the connection closes once the peer closes its side. Pass `closeOnPeerEof: false` to `create()` to keep writing after a peer half-close until you call `close()`.
 
-`destroy()` aborts a connection without draining output; pending writes fail, and a connect, TLS handshake or `reconnect()` in flight ends with `SocksCancelledException`. Use `close()` to drain accepted output before closing; it ends a connect or `reconnect()` in flight the same way.
+`destroy()` aborts a connection without draining output; pending writes fail, and a connect, TLS handshake or `reconnect()` in flight ends with `SocksCancelledException`. Use `close()` to drain accepted output before closing; it ends a connect or `reconnect()` in flight the same way. When a protocol requires request EOF before the response, use `closeOutput()`, consume the response from `inputStream`, then call `close()`.
 
 ## Migrating to 2.0.0
 
@@ -104,14 +104,14 @@ By default the connection closes once the peer closes its side. Pass `closeOnPee
 | Previous operation | Replacement |
 | --- | --- |
 | `socks.socket.destroy()` | `socks.destroy()` |
-| `socks.socket.close()` | `await socks.close()` |
+| `socks.socket.close()` | `await socks.closeOutput()` to preserve input (the native half-close behavior), or `await socks.close()` to close both directions |
 | `socks.socket.add(bytes)` | `socks.outputStream.add(bytes)` |
 | `socks.socket.addStream(source)` | `await socks.outputStream.addStream(source)` |
 | Reading the underlying socket | `socks.inputStream` or `socks.listen(...)` |
 | `socks.responseController`, `socks.subscription` | `socks.inputStream`; pause or cancel your own subscription to it |
 | `SecureSocket.secure(socks.socket, ...)` | Set `sslEnabled: true` and, if needed, `securityContext` on `SOCKSSocket.create(...)` |
 
-For an awaited binary write, use `await socks.outputStream.addStream(Stream.value(bytes))`. The output sink accepts one stream at a time. For text, use `await socks.write(text)`. To drain and finish the connection, use `await socks.close()`.
+For an awaited binary write, use `await socks.outputStream.addStream(Stream.value(bytes))`. The output sink accepts one stream at a time. For text, use `await socks.write(text)`. To signal request EOF while continuing to receive, use `await socks.closeOutput()`. To drain and finish the entire connection, use `await socks.close()`.
 
 Built-in TLS starts during `connectTo()`, after the SOCKS handshake. Upgrading an established plaintext application session to TLS is not exposed by `SOCKSSocket`.
 

@@ -121,6 +121,31 @@ void main() {
     await socket.outputStream.close();
   });
 
+  test('a rejected addStream does not leave output shutdown pending', () async {
+    final proxy = MockSocksServer();
+    await proxy.start();
+    addTearDown(proxy.stop);
+    final socket = await SOCKSSocket.create(
+      proxyHost: InternetAddress.loopbackIPv4.address,
+      proxyPort: proxy.port,
+    );
+    addTearDown(() => socket.close().catchError((_) {}));
+    await socket.connect();
+    await socket.connectTo('localhost', 443);
+
+    final source = StreamController<List<int>>();
+    addTearDown(source.close);
+    final first = source.stream.listen((_) {});
+    addTearDown(first.cancel);
+    expect(
+        () => socket.outputStream.addStream(source.stream), throwsStateError);
+
+    final reply = socket.inputStream.first;
+    socket.outputStream.add([65]);
+    expect(await reply.timeout(const Duration(seconds: 2)), [65]);
+    await socket.close().timeout(const Duration(seconds: 2));
+  });
+
   test('output during the handshake does not abort it', () async {
     final proxy = MockSocksServer()
       ..responseDelay = const Duration(milliseconds: 100);
@@ -245,6 +270,7 @@ void main() {
     }
     expect(socket.state, ConnectionState.error);
     await expectLater(socket.write('B'), throwsStateError);
+    await expectLater(socket.close(), throwsA(isA<SocksConnectionException>()));
   });
 
   test('a write failing after reconnect does not affect the new connection',
@@ -322,7 +348,7 @@ void main() {
       proxyPort: server.port,
       operationTimeout: const Duration(milliseconds: 100),
     );
-    addTearDown(socket.close);
+    addTearDown(() => socket.close().catchError((_) {}));
     await socket.connect();
     await socket.connectTo('localhost', 443);
     final inputDone = socket.inputStream.drain<void>();
@@ -334,5 +360,6 @@ void main() {
     await inputDone;
     expect(socket.state, ConnectionState.error);
     await expectLater(socket.write('Z'), throwsStateError);
+    await expectLater(socket.close(), throwsA(isA<TimeoutException>()));
   });
 }

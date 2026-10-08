@@ -63,12 +63,18 @@ int? socksConnectReplyLength(List<int> reply) {
 Future<void> negotiateSocks({
   required Future<void> Function(List<int>) write,
   required Future<List<int>> Function(int) read,
+  Future<List<int>> Function(List<int>, int)? exchange,
   List<int>? credentials,
   bool allowNoAuthFallback = false,
 }) async {
+  Future<List<int>> requestReply(List<int> request, int replyLength) async {
+    if (exchange != null) return exchange(request, replyLength);
+    await write(request);
+    return read(replyLength);
+  }
+
   final methods = credentials == null ? [0] : [if (allowNoAuthFallback) 0, 2];
-  await write([5, methods.length, ...methods]);
-  final greeting = await read(2);
+  final greeting = await requestReply([5, methods.length, ...methods], 2);
   if (greeting[0] != 5) {
     throw const SocksProtocolFailure('invalid reply version');
   }
@@ -84,8 +90,7 @@ Future<void> negotiateSocks({
     throw const SocksProtocolFailure('proxy rejected authentication method');
   }
   if (greeting[1] == 2) {
-    await write(credentials!);
-    final auth = await read(2);
+    final auth = await requestReply(credentials!, 2);
     if (auth[0] != 1 || auth[1] != 0) {
       throw const SocksProtocolFailure('username/password auth rejected',
           rejected: true);

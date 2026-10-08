@@ -54,6 +54,24 @@ class _PendingWriteSocket extends Stream<RawSocketEvent> implements RawSocket {
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
+class _FakeRawSocketConnectTask implements RawSocketConnectTask {
+  final Completer<RawSocket> result;
+  bool cancelled = false;
+
+  _FakeRawSocketConnectTask(this.result);
+
+  @override
+  Future<RawSocket> get socket => result.future;
+
+  @override
+  void cancel() {
+    cancelled = true;
+    if (!result.isCompleted) {
+      result.completeError(const SocketException('cancelled'));
+    }
+  }
+}
+
 /// A socket that fails its next read or write synchronously: dart:io delivers
 /// the error through the event stream and closes the socket before the call
 /// returns, so no event follows. A plain socket reports a read failure this
@@ -122,6 +140,29 @@ class _ResetSocket extends Stream<RawSocketEvent> implements RawSocket {
 }
 
 void main() {
+  for (final delayedStart in [false, true]) {
+    test(
+        'cancellable connect cancels ${delayedStart ? 'before' : 'after'} the task is created',
+        () async {
+      final start = Completer<void>();
+      final socket = Completer<RawSocket>();
+      socket.future.ignore();
+      final task = _FakeRawSocketConnectTask(socket);
+      final connector = CancellableRawSocketConnect((_, __) async {
+        if (delayedStart) await start.future;
+        return task;
+      });
+      final connecting = connector.connect(InternetAddress.loopbackIPv4.address,
+          1080, const Duration(seconds: 2));
+      final failed = expectLater(connecting, throwsA(isA<SocketException>()));
+      if (!delayedStart) await Future<void>.value();
+      connector.cancel();
+      if (delayedStart) start.complete();
+      await failed.timeout(const Duration(seconds: 1));
+      expect(task.cancelled, isTrue);
+    });
+  }
+
   test('flush followed by close delivers the complete TCP payload', () async {
     final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
     addTearDown(server.close);

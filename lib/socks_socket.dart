@@ -89,6 +89,9 @@ enum _Phase {
   requesting,
   connected,
 
+  /// Output is shut down, but [SOCKSSocket.inputStream] may still receive.
+  receiving,
+
   /// [SOCKSSocket.close] is draining accepted output.
   closing,
 
@@ -164,7 +167,7 @@ class SOCKSSocket {
   StreamSubscription<List<int>>? _subscription;
 
   /// The proxy TCP connect in flight, so [close] and [destroy] can end it.
-  ConnectionTask<RawSocket>? _connectTask;
+  CancellableRawSocketConnect? _proxyConnect;
 
   /// Ends the handshake in flight; see [_signalCancel].
   Completer<Never>? _cancel;
@@ -177,6 +180,7 @@ class SOCKSSocket {
   StackTrace? _writeFailureStack;
 
   Future<void>? _closeFuture;
+  Future<void>? _closeOutputFuture;
 
   /// Set by [close] and [destroy]; a [reconnect] in flight stops at its next
   /// step instead of opening a connection the caller has already given up.
@@ -212,6 +216,16 @@ class SOCKSSocket {
     bool? requireIsolation,
     bool closeOnPeerEof = true,
   }) async {
+    if (proxyHost.isEmpty) throw ArgumentError.value(proxyHost, 'proxyHost');
+    if (proxyPort < 1 || proxyPort > 65535) {
+      throw ArgumentError.value(proxyPort, 'proxyPort');
+    }
+    if (handshakeTimeout <= Duration.zero) {
+      throw ArgumentError.value(handshakeTimeout, 'handshakeTimeout');
+    }
+    if (operationTimeout <= Duration.zero) {
+      throw ArgumentError.value(operationTimeout, 'operationTimeout');
+    }
     _checkIsolationToken(isolationToken);
     if (requireIsolation == true && isolationToken == null) {
       throw ArgumentError(
@@ -253,7 +267,7 @@ class SOCKSSocket {
         _Phase.greeted ||
         _Phase.requesting =>
           SocksSocketState.connecting,
-        _Phase.connected => SocksSocketState.connected,
+        _Phase.connected || _Phase.receiving => SocksSocketState.connected,
         _Phase.failed => SocksSocketState.error,
       };
 
@@ -295,7 +309,9 @@ class SOCKSSocket {
     });
     if (_writeFailure != null) {
       sink._stop(_writeFailure!, _writeFailureStack!);
-    } else if (_phase == _Phase.closing || _phase == _Phase.closed) {
+    } else if (_phase == _Phase.receiving ||
+        _phase == _Phase.closing ||
+        _phase == _Phase.closed) {
       sink.close().ignore();
     }
     return sink;
@@ -306,20 +322,13 @@ class SOCKSSocket {
 
   /// Opens the TCP connection to the proxy.
   Future<void> _init() async {
-    final task =
-        _connectTask = await RawSocket.startConnect(proxyHost, proxyPort);
-    // A close() or destroy() while the task was being created found nothing
-    // to cancel yet.
-    if (_closeRequested) task.cancel();
+    final operation = _proxyConnect = CancellableRawSocketConnect();
+    if (_closeRequested) operation.cancel();
     final RawSocket raw;
     try {
-      raw = await task.socket.timeout(_handshakeTimeout, onTimeout: () {
-        task.cancel();
-        throw SocketException(
-            'Connection timed out, host: $proxyHost, port: $proxyPort');
-      });
+      raw = await operation.connect(proxyHost, proxyPort, _handshakeTimeout);
     } finally {
-      _connectTask = null;
+      if (identical(_proxyConnect, operation)) _proxyConnect = null;
     }
     _channel = RawChannel(raw);
     _cancel = Completer<Never>()..future.ignore();
@@ -339,15 +348,18 @@ class SOCKSSocket {
     _phase = _Phase.greeting;
     final channel = _channel!;
     try {
-      await _handshake(() => negotiateSocks(
-            write: channel.write,
-            read: (count) => _readReply(channel, count),
-            credentials: _isolationToken == null
-                ? null
-                : encodeSocksCredentials(_isolationToken!, _isolationToken!),
-            allowNoAuthFallback:
-                !(_requireIsolation ?? _isolationToken != null),
-          ));
+      await negotiateSocks(
+        write: channel.write,
+        read: (count) => _readReply(channel, count),
+        exchange: (request, count) => _handshake(() async {
+          await channel.write(request);
+          return _readReply(channel, count);
+        }),
+        credentials: _isolationToken == null
+            ? null
+            : encodeSocksCredentials(_isolationToken!, _isolationToken!),
+        allowNoAuthFallback: !(_requireIsolation ?? _isolationToken != null),
+      );
       _phase = _Phase.greeted;
     } catch (error) {
       throw _handshakeFailed(error, 'SOCKS5 handshake failed: ');
@@ -410,10 +422,13 @@ class SOCKSSocket {
             ? e
             : SocksConnectionException(message: 'SOCKS5 connection error: $e');
         if (!_input.isClosed) _input.addError(error);
-        if (_phase == _Phase.connected) _fail(error, stack, _Phase.failed);
+        if (_phase == _Phase.connected || _phase == _Phase.receiving) {
+          _fail(error, stack, _Phase.failed);
+        }
       },
       onDone: () {
-        if (_phase == _Phase.connected && _closeOnPeerEof) {
+        if ((_phase == _Phase.connected || _phase == _Phase.receiving) &&
+            _closeOnPeerEof) {
           _ensureClosed().ignore();
         }
         if (!_input.isClosed) _input.close();
@@ -572,6 +587,32 @@ class SOCKSSocket {
 
   Future<void> _ensureClosed() => _closeFuture ??= _close();
 
+  /// Drains accepted output and shuts down only the sending direction.
+  ///
+  /// [inputStream] remains open so a peer that waits for request EOF before
+  /// replying can still deliver its response. Call [close] after consuming
+  /// that response to release the remaining connection resources.
+  Future<void> closeOutput() {
+    if (_phase == _Phase.receiving) {
+      return _closeOutputFuture ?? Future<void>.value();
+    }
+    if (_phase != _Phase.connected) {
+      throw StateError(
+          'Cannot close output: socket is not connected (state: $state)');
+    }
+    return _closeOutputFuture ??= _closeOutput();
+  }
+
+  Future<void> _closeOutput() async {
+    final transport = _transport!;
+    await _outputSink?.close().timeout(_operationTimeout);
+    await _writeTail;
+    _throwWriteFailure();
+    await transport.flush().timeout(_operationTimeout);
+    await transport.close();
+    if (_phase == _Phase.connected) _phase = _Phase.receiving;
+  }
+
   /// Tears the connection down at once, without draining output.
   ///
   /// Writes not yet delivered, through [write] or [outputStream], fail with a
@@ -608,7 +649,7 @@ class SOCKSSocket {
   /// Ends a connect in flight. The TLS handshake cannot notice a destroyed
   /// transport on its own, so it waits for this or for its deadline.
   void _signalCancel(SocksCancelledException error) {
-    _connectTask?.cancel();
+    _proxyConnect?.cancel();
     final cancel = _cancel;
     if (cancel != null && !cancel.isCompleted) cancel.completeError(error);
   }
@@ -633,7 +674,7 @@ class SOCKSSocket {
   Future<void> _close() async {
     _signalCancel(_closedBeforeConnected());
     _phase = switch (_phase) {
-      _Phase.connected => _Phase.closing,
+      _Phase.connected || _Phase.receiving => _Phase.closing,
       _Phase.failed => _Phase.failed,
       _ => _Phase.closed,
     };
@@ -641,14 +682,17 @@ class SOCKSSocket {
     final transport = _transport;
     var flushed = false;
     try {
-      await _outputSink?.close().timeout(_operationTimeout);
-      await _writeTail;
-      if (transport != null &&
-          channel != null &&
-          !channel.isClosed &&
-          _writeFailure == null) {
-        await transport.flush().timeout(_operationTimeout);
-        flushed = true;
+      final closingOutput = _closeOutputFuture;
+      if (closingOutput != null) {
+        await closingOutput;
+      } else {
+        await _outputSink?.close().timeout(_operationTimeout);
+        await _writeTail;
+        _throwWriteFailure();
+        if (transport != null && channel != null && !channel.isClosed) {
+          await transport.flush().timeout(_operationTimeout);
+          flushed = true;
+        }
       }
     } catch (error, stack) {
       _outputSink?._stop(error, stack);
@@ -661,6 +705,12 @@ class SOCKSSocket {
       await _subscription?.cancel();
       channel?.destroy();
       if (!_input.isClosed) _input.close();
+    }
+  }
+
+  void _throwWriteFailure() {
+    if (_writeFailure != null) {
+      Error.throwWithStackTrace(_writeFailure!, _writeFailureStack!);
     }
   }
 
@@ -706,6 +756,7 @@ class SOCKSSocket {
     _writeFailure = null;
     _writeFailureStack = null;
     _closeFuture = null;
+    _closeOutputFuture = null;
     _phase = _Phase.idle;
 
     try {
@@ -820,8 +871,13 @@ class _SocketOutputSink implements StreamSink<List<int>> {
   @override
   Future<void> addStream(Stream<List<int>> stream) {
     _checkOpen();
-    final completed = _streamDone = Completer<void>();
-    final source = _source = stream.listen(null, cancelOnError: true);
+    final completed = Completer<void>();
+    // listen() is allowed to throw synchronously (for example when a
+    // single-subscription stream was already consumed). Do not publish the
+    // pending stream state until the subscription was accepted.
+    final source = stream.listen(null, cancelOnError: true);
+    _streamDone = completed;
+    _source = source;
     source
       ..onData((List<int> data) {
         source.pause();

@@ -54,29 +54,6 @@ void main() {
           await client.close().timeout(tunnelDeadline);
         });
 
-        test('while the proxy TCP connect is pending', () async {
-          final server = await TunnelServer.start(tls: tls);
-          final (client, peer) = await server.connect(
-              handshakeTimeout: const Duration(seconds: 2));
-          if (!await server.stall()) {
-            markTestSkipped('This host completes connects beyond the backlog');
-            return;
-          }
-          final reconnecting = client.reconnect();
-          final failed = expectLater(
-              reconnecting, throwsA(isA<SocksCancelledException>()));
-          await peer.done.future.timeout(tunnelDeadline);
-          await Future<void>.delayed(const Duration(milliseconds: 100));
-          final stopwatch = Stopwatch()..start();
-          final tearingDown = teardown(client);
-          await failed.timeout(tunnelDeadline);
-          expect(stopwatch.elapsed, lessThan(const Duration(seconds: 1)));
-          await tearingDown.timeout(tunnelDeadline);
-          expect(client.state, SocksSocketState.disconnected);
-          await expectLater(client.write('A'), throwsStateError);
-          await client.close().timeout(tunnelDeadline);
-        });
-
         test('from the old inputStream ending', () async {
           // reconnect() creates the connect task a few microtasks after the
           // old connection's close completes, and the old inputStream's done
@@ -88,10 +65,7 @@ void main() {
             for (var i = 0; i < microtasks; i++)
               await server.connect(handshakeTimeout: const Duration(seconds: 2))
           ];
-          if (!await server.stall()) {
-            markTestSkipped('This host completes connects beyond the backlog');
-            return;
-          }
+          server.holdGreeting = TunnelHold();
           for (var delay = 0; delay < microtasks; delay++) {
             final (client, _) = clients[delay];
             final stopwatch = Stopwatch();

@@ -53,10 +53,7 @@ class TunnelServer {
   final TestCertificates? certificates;
   final _peers = StreamController<TunnelPeer>();
   late final _accepted = StreamIterator(_peers.stream);
-  late final StreamSubscription<RawSocket> _accepting;
   late final int port = _server.port;
-  RawServerSocket? _blocked;
-  final _fillers = <ConnectionTask<Socket>>[];
   int connections = 0;
 
   /// Delays the greeting reply, so a client stays in connect().
@@ -70,7 +67,7 @@ class TunnelServer {
   TunnelHold? holdTls;
 
   TunnelServer._(this._server, this.certificates) {
-    _accepting = _server.listen(_serve);
+    _server.listen(_serve);
   }
 
   bool get tls => certificates != null;
@@ -149,30 +146,6 @@ class TunnelServer {
     return accepted;
   }
 
-  /// Replaces the listener with one that never accepts and fills its
-  /// backlog, so a later TCP connect to [port] stays pending. Returns false
-  /// when this host completes such connects anyway.
-  Future<bool> stall() async {
-    await _accepting.cancel();
-    await _server.close();
-    try {
-      _blocked = await RawServerSocket.bind(InternetAddress.loopbackIPv4, port,
-          backlog: 1);
-    } on SocketException {
-      return false;
-    }
-    for (var i = 0; i < 4; i++) {
-      final task =
-          await Socket.startConnect(InternetAddress.loopbackIPv4, port);
-      _fillers.add(task);
-      final connected = task.socket
-          .then((_) => true, onError: (Object _) => false)
-          .timeout(const Duration(milliseconds: 300), onTimeout: () => false);
-      if (!await connected) return true;
-    }
-    return false;
-  }
-
   /// The next tunnel the server completed.
   Future<TunnelPeer> nextPeer() async {
     if (!await _accepted.moveNext().timeout(tunnelDeadline)) {
@@ -219,12 +192,7 @@ class TunnelServer {
     for (final hold in [holdGreeting, holdConnect, holdTls]) {
       if (hold != null && !hold.release.isCompleted) hold.release.complete();
     }
-    for (final filler in _fillers) {
-      filler.cancel();
-      filler.socket.then((s) => s.destroy(), onError: (Object _) {});
-    }
     await _server.close();
-    await _blocked?.close();
     await _accepted.cancel();
     // Without a listener the controller's close() would never complete.
     _peers.close().ignore();

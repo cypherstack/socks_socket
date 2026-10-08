@@ -15,6 +15,28 @@ final _soLinger = Platform.isMacOS ? 0x80 : 13;
 
 void main() {
   for (final tls in [false, true]) {
+    test('closeOutput preserves a response sent after request EOF (TLS=$tls)',
+        () async {
+      final (client, peer) = await connectTunnel(tls: tls);
+      final response = client.inputStream.first;
+      await client.write('request');
+      await client.closeOutput().timeout(_deadline);
+      await client.closeOutput().timeout(_deadline);
+      await expectLater(client.write('late'), throwsStateError);
+      expect(() => client.outputStream.add([0]), throwsStateError);
+      await peer.done.future.timeout(_deadline);
+      expect(peer.bytes.takeBytes(), 'request'.codeUnits);
+
+      peer.socket.add([42]);
+      await peer.socket.flush();
+      expect(await response.timeout(_deadline), [42]);
+      expect(client.state, SocksSocketState.connected);
+      await client.close().timeout(_deadline);
+      expect(client.state, SocksSocketState.disconnected);
+    });
+  }
+
+  for (final tls in [false, true]) {
     test('peer EOF drains a pending write (TLS=$tls)', () async {
       final (client, peer) = await connectTunnel(tls: tls);
       final eof = client.inputStream.drain<void>();

@@ -3,6 +3,61 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+abstract interface class RawSocketConnectTask {
+  Future<RawSocket> get socket;
+  void cancel();
+}
+
+final class _IoRawSocketConnectTask implements RawSocketConnectTask {
+  final ConnectionTask<RawSocket> _task;
+  _IoRawSocketConnectTask(this._task);
+
+  @override
+  Future<RawSocket> get socket => _task.socket;
+
+  @override
+  void cancel() => _task.cancel();
+}
+
+typedef RawSocketStarter = Future<RawSocketConnectTask> Function(
+    String host, int port);
+
+Future<RawSocketConnectTask> _startRawSocket(String host, int port) async =>
+    _IoRawSocketConnectTask(await RawSocket.startConnect(host, port));
+
+/// One cancellable attempt to open a raw socket.
+///
+/// Cancellation is sticky, including while [RawSocket.startConnect] is still
+/// creating its [ConnectionTask]. This class is public only within `src/` so
+/// the timing-sensitive behavior can be tested without relying on a host's TCP
+/// listen-backlog behavior.
+class CancellableRawSocketConnect {
+  final RawSocketStarter _start;
+  RawSocketConnectTask? _task;
+  bool _cancelled = false;
+
+  CancellableRawSocketConnect([RawSocketStarter start = _startRawSocket])
+      : _start = start;
+
+  Future<RawSocket> connect(String host, int port, Duration timeout) async {
+    final task = _task = await _start(host, port);
+    if (_cancelled) task.cancel();
+    try {
+      return await task.socket.timeout(timeout, onTimeout: () {
+        task.cancel();
+        throw SocketException('Connection timed out, host: $host, port: $port');
+      });
+    } finally {
+      _task = null;
+    }
+  }
+
+  void cancel() {
+    _cancelled = true;
+    _task?.cancel();
+  }
+}
+
 class RawChannel {
   final RawSocket raw;
   late final StreamSubscription<RawSocketEvent> _subscription;
