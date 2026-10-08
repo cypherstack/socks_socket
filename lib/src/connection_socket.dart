@@ -66,6 +66,7 @@ class RawChannel {
   Completer<void>? _writable;
   bool _closed = false;
   bool _readClosed = false;
+  bool _writeClosed = false;
   bool _detached = false;
   bool _streaming = false;
   Object? _error;
@@ -92,11 +93,7 @@ class RawChannel {
         }
       },
       onCancel: () {
-        if (!_readClosed && !_closed && !_detached) {
-          _readClosed = true;
-          raw.readEventsEnabled = false;
-          raw.shutdown(SocketDirection.receive);
-        }
+        _closeRead();
       },
     );
     _subscription = raw.listen(_event, onError: (Object error) {
@@ -125,6 +122,7 @@ class RawChannel {
       _readable?.complete();
       _readable = null;
       if (_streaming && !_incoming.isClosed) _incoming.close();
+      if (_writeClosed) destroy();
     } else if (event == RawSocketEvent.closed) {
       destroy();
     }
@@ -191,6 +189,27 @@ class RawChannel {
     return raw is RawSecureSocket ? _TlsSocket(this) : _ConnectionSocket(this);
   }
 
+  void _closeRead() {
+    if (_readClosed || _closed || _detached) return;
+    _readClosed = true;
+    raw.readEventsEnabled = false;
+    try {
+      raw.shutdown(SocketDirection.receive);
+    } finally {
+      if (_writeClosed) destroy();
+    }
+  }
+
+  void _closeWrite() {
+    if (_writeClosed || _closed) return;
+    _writeClosed = true;
+    try {
+      raw.shutdown(SocketDirection.send);
+    } finally {
+      if (_readClosed) destroy();
+    }
+  }
+
   void destroy() {
     if (_closed) return;
     _closed = true;
@@ -248,9 +267,7 @@ class _RawConsumer implements StreamConsumer<List<int>> {
   }
 
   @override
-  Future<void> close() async {
-    if (!channel._closed) channel.raw.shutdown(SocketDirection.send);
-  }
+  Future<void> close() async => channel._closeWrite();
 }
 
 class _ConnectionSocket extends StreamView<Uint8List> implements Socket {

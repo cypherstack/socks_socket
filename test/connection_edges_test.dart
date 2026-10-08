@@ -23,6 +23,8 @@ void main() {
     expect(
         await proxy.applicationData.future.timeout(const Duration(seconds: 2)),
         [99]);
+    await socket.close();
+    await proxy.disconnected.future.timeout(const Duration(seconds: 2));
   });
 
   test('upload stream errors close transport and retain the original error',

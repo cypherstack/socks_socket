@@ -10,6 +10,8 @@ class _PendingWriteSocket extends Stream<RawSocketEvent> implements RawSocket {
   final writeStarted = Completer<void>();
   bool pendingWrite = false;
   bool closedWithPendingWrite = false;
+  bool closed = false;
+  final shutdowns = <SocketDirection>[];
 
   @override
   bool readEventsEnabled = false;
@@ -40,11 +42,13 @@ class _PendingWriteSocket extends Stream<RawSocketEvent> implements RawSocket {
 
   @override
   void shutdown(SocketDirection direction) {
+    shutdowns.add(direction);
     closedWithPendingWrite |= pendingWrite;
   }
 
   @override
   Future<RawSocket> close() async {
+    closed = true;
     closedWithPendingWrite |= pendingWrite;
     events.close();
     return this;
@@ -140,6 +144,32 @@ class _ResetSocket extends Stream<RawSocketEvent> implements RawSocket {
 }
 
 void main() {
+  for (final inputFirst in [true, false]) {
+    test(
+        'channel closes after both directions close (${inputFirst ? 'input' : 'output'} first)',
+        () async {
+      final raw = _PendingWriteSocket();
+      final socket = RawChannel(raw).socket();
+      final input = socket.listen((_) {});
+
+      if (inputFirst) {
+        await input.cancel();
+        expect(raw.shutdowns, [SocketDirection.receive]);
+        expect(raw.closed, isFalse);
+        await socket.close();
+      } else {
+        await socket.close();
+        expect(raw.shutdowns, [SocketDirection.send]);
+        expect(raw.closed, isFalse);
+        await input.cancel();
+      }
+
+      expect(raw.shutdowns,
+          containsAll([SocketDirection.receive, SocketDirection.send]));
+      expect(raw.closed, isTrue);
+    });
+  }
+
   for (final delayedStart in [false, true]) {
     test(
         'cancellable connect cancels ${delayedStart ? 'before' : 'after'} the task is created',
