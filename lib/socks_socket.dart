@@ -146,6 +146,9 @@ class SOCKSSocket {
 
   final SecurityContext? _securityContext;
 
+  /// Passed to [RawSecureSocket.secure]; ignored with [allowBadCertificates].
+  final bool Function(X509Certificate)? _onBadCertificate;
+
   final bool? _requireIsolation;
 
   final bool _closeOnPeerEof;
@@ -199,6 +202,7 @@ class SOCKSSocket {
       this._operationTimeout,
       this._allowBadCertificates,
       this._securityContext,
+      this._onBadCertificate,
       this._requireIsolation,
       this._closeOnPeerEof);
 
@@ -216,6 +220,7 @@ class SOCKSSocket {
     Duration operationTimeout = const Duration(seconds: 30),
     bool allowBadCertificates = false,
     SecurityContext? securityContext,
+    bool Function(X509Certificate)? onBadCertificate,
     bool? requireIsolation,
     bool closeOnPeerEof = true,
   }) async {
@@ -245,6 +250,7 @@ class SOCKSSocket {
         operationTimeout,
         allowBadCertificates,
         securityContext,
+        onBadCertificate,
         requireIsolation,
         closeOnPeerEof);
     await instance._init();
@@ -408,7 +414,8 @@ class SOCKSSocket {
           subscription: channel.detach(),
           host: domain,
           context: _securityContext,
-          onBadCertificate: _allowBadCertificates ? (_) => true : null,
+          onBadCertificate:
+              _allowBadCertificates ? (_) => true : _onBadCertificate,
         );
         try {
           _channel = RawChannel(await _handshake(() => upgrade));

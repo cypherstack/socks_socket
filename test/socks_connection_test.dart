@@ -10,6 +10,7 @@ ConnectionTask<Socket> connect(TunnelProxy proxy,
         {String host = 'unresolvable.invalid',
         String? tlsHost,
         SecurityContext? context,
+        bool Function(X509Certificate)? onBadCertificate,
         SocksCredentials? credentials,
         List<String>? supportedProtocols,
         Duration timeout = const Duration(seconds: 3)}) =>
@@ -20,6 +21,7 @@ ConnectionTask<Socket> connect(TunnelProxy proxy,
         targetPort: 443,
         tlsHost: tlsHost,
         securityContext: context,
+        onBadCertificate: onBadCertificate,
         credentials: credentials,
         supportedProtocols: supportedProtocols,
         timeout: timeout);
@@ -252,6 +254,31 @@ void main() {
       await proxy.disconnected.future.timeout(const Duration(seconds: 2));
     });
   }
+  test('onBadCertificate can accept an untrusted certificate', () async {
+    final server = await SecureServerSocket.bind(
+        InternetAddress.loopbackIPv4, 0, certificates.serverContext());
+    final accepted = <Socket>[];
+    server.listen(accepted.add, onError: (Object _) {});
+    addTearDown(() async {
+      for (final socket in accepted) {
+        socket.destroy();
+      }
+      await server.close();
+    });
+    final proxy = TunnelProxy(upstreamPort: server.port);
+    await proxy.start();
+    addTearDown(proxy.close);
+    X509Certificate? offered;
+    final socket = await connect(proxy,
+        tlsHost: 'localhost', context: SecurityContext(withTrustedRoots: false),
+        onBadCertificate: (certificate) {
+      offered = certificate;
+      return true;
+    }).socket;
+    addTearDown(socket.destroy);
+    expect(socket, isA<SecureSocket>());
+    expect(offered, isNotNull);
+  });
   test('renegotiate is unsupported on the TLS socket', () async {
     final server = await SecureServerSocket.bind(
         InternetAddress.loopbackIPv4, 0, certificates.serverContext());
