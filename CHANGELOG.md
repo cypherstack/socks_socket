@@ -1,3 +1,7 @@
+## 2.1.0
+
+- Add `onBadCertificate` to `SOCKSSocket.create()` and `SocksConnection.start()`, passed through to `RawSecureSocket.secure`. `allowBadCertificates: true` still accepts everything.
+
 ## 2.0.0
 
 - **Breaking:** Remove `SOCKSSocket.socket` so transport operations cannot bypass the wrapper's write queue and lifecycle tracking. Use `destroy()`, `closeOutput()`, `close()`, `write()`, `outputStream`, and `inputStream` instead. `closeOutput()` preserves the native socket's write-side half-close behavior.

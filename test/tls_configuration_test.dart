@@ -28,4 +28,29 @@ void main() {
     await socket.write('custom TLS');
     expect(utf8.decode(await reply), 'custom TLS');
   });
+
+  test('SOCKSSocket passes onBadCertificate to the TLS upgrade', () async {
+    final certificates = TestCertificates.generate();
+    final proxy = MockSocksServer()
+      ..sslEnabled = true
+      ..securityContext = certificates.serverContext();
+    await proxy.start();
+    addTearDown(proxy.stop);
+    X509Certificate? offered;
+    final socket = await SOCKSSocket.create(
+      proxyHost: InternetAddress.loopbackIPv4.address,
+      proxyPort: proxy.port,
+      sslEnabled: true,
+      securityContext: SecurityContext(withTrustedRoots: false),
+      onBadCertificate: (certificate) {
+        offered = certificate;
+        return true;
+      },
+    );
+    addTearDown(socket.close);
+    await socket.connect();
+    await socket.connectTo('localhost', 443);
+    expect(socket.state, ConnectionState.connected);
+    expect(offered, isNotNull);
+  });
 }

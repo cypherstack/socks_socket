@@ -38,6 +38,7 @@ class SocksConnection {
     required int targetPort,
     String? tlsHost,
     SecurityContext? securityContext,
+    bool Function(X509Certificate)? onBadCertificate,
     SocksCredentials? credentials,
     List<String>? supportedProtocols,
     Duration timeout = const Duration(seconds: 30),
@@ -55,7 +56,7 @@ class SocksConnection {
     final request = encodeSocksDestination(targetHost, targetPort);
     final operation = _ConnectOperation();
     operation.run(proxyHost, proxyPort, request, tlsHost, securityContext,
-        credentials, supportedProtocols, timeout);
+        onBadCertificate, credentials, supportedProtocols, timeout);
     return ConnectionTask.fromSocket(operation.result.future, operation.cancel);
   }
 }
@@ -90,6 +91,7 @@ class _ConnectOperation {
       List<int> request,
       String? tlsHost,
       SecurityContext? context,
+      bool Function(X509Certificate)? onBadCertificate,
       SocksCredentials? credentials,
       List<String>? supportedProtocols,
       Duration timeout) async {
@@ -127,6 +129,7 @@ class _ConnectOperation {
             subscription: channel.detach(),
             host: tlsHost,
             context: context,
+            onBadCertificate: onBadCertificate,
             supportedProtocols: supportedProtocols);
         _raw = secured;
         if (_aborted) {
